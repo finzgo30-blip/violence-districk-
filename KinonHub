@@ -100,7 +100,7 @@ State.PlayerESPObj = (function()
 		if ch:GetAttribute("IsCarried") == true then return "CARRIED", palette.Carried, frac end
 		if ch:GetAttribute("Knocked") == true then return "DOWN", palette.Downed, frac end
 		if hum and hum.Health > 0 and hum.Health < hum.MaxHealth - 0.01 then
-			return "LOW", palette.Injured, frac
+			return "INJURED", palette.Injured, frac
 		end
 		return "HEALTHY", palette.Player, frac
 	end
@@ -348,8 +348,10 @@ State.PlayerESPObj = (function()
 				local color = killer and P.Killer or P.Player
 
 				local stText, stColor
-				if not killer and S.ShowStatus then
+				if not killer then
 					stText, stColor = U.Status(ch, P)
+					if stColor then color = stColor end
+					if not S.ShowStatus then stText = nil end
 				end
 
 				if want then
@@ -1323,10 +1325,18 @@ State.SpearObj = (function()
 		if not V.Enabled or (method ~= "FireServer" and method ~= "fireServer") then
 			return old(self, ...)
 		end
-		if typeof(self) ~= "Instance" or string.lower(self.Name) ~= "spearthrow" then
+		local isSpear = false
+		pcall(function()
+			isSpear = typeof(self) == "Instance" and string.lower(self.Name) == "spearthrow"
+		end)
+		if not isSpear then
+			if setnamecallmethod then pcall(setnamecallmethod, method) end
 			return old(self, ...)
 		end
-		if checkcaller and checkcaller() then return old(self, ...) end
+		if checkcaller and checkcaller() then
+			if setnamecallmethod then pcall(setnamecallmethod, method) end
+			return old(self, ...)
+		end
 
 		local args = table.pack(...)
 		local trailOrigin, trailDir, trailSpeed
@@ -1389,6 +1399,7 @@ State.SpearObj = (function()
 			end
 		end)
 
+		if setnamecallmethod then pcall(setnamecallmethod, method) end
 		if setnamecallmethod then pcall(setnamecallmethod, method) end
 		local ret = old(self, unpack(args, 1, args.n))
 		if trailOrigin then task.defer(showTrail, trailOrigin, trailDir, trailSpeed) end
@@ -1538,6 +1549,35 @@ State.SpearObj = (function()
 		pcall(function()
 			local old
 			old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+				local method = getnamecallmethod()
+				if method == "FireServer" or method == "fireServer" then
+					local fr = State.FlashRemote
+					if fr and self == fr and State.FlashSetActive then
+						local fa = { ... }
+						pcall(State.FlashSetActive, fa[2] == true, fa[1])
+						if setnamecallmethod then pcall(setnamecallmethod, method) end
+					end
+					if State.AntiBlindOn and not (checkcaller and checkcaller()) and State.IsKillerNow and State.IsKillerNow() then
+						local blockBlind = false
+						pcall(function()
+							local n = string.lower(tostring(self:GetFullName()))
+							if n:find("blind", 1, true) then blockBlind = true end
+						end)
+						if blockBlind then return nil end
+						if setnamecallmethod then pcall(setnamecallmethod, method) end
+					end
+					local ns = State.NoSlow
+					if ns and (ns.K or ns.S) and not (checkcaller and checkcaller()) then
+						local block = false
+						pcall(function()
+							if self.Name == "Fall" and self.Parent and self.Parent.Name == "Mechanics" then
+								block = true
+							end
+						end)
+						if block then return nil end
+						if setnamecallmethod then pcall(setnamecallmethod, method) end
+					end
+				end
 				local handler = V.NamecallHandler
 				if handler then return handler(old, self, ...) end
 				return old(self, ...)
@@ -1549,6 +1589,333 @@ State.SpearObj = (function()
 
 	return V
 end)()
+
+State.TOF = {
+	Enabled = false,
+	ShowLaser = false,
+	TargetMode = "Killer",
+	FOV = 250,
+	Smooth = 50,
+	Predict = 12,
+	Vis = true,
+}
+
+State.TOFObj = (function()
+	local T = State.TOF
+	local obj = {}
+	local conns, btnConns = {}, {}
+	local holding, token, curBtn, laserPart = false, 0, nil, nil
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local laserRay = RaycastParams.new()
+	laserRay.FilterType = Enum.RaycastFilterType.Exclude
+
+	local function hideLaser()
+		if laserPart then laserPart.Transparency = 1 end
+	end
+
+	local function visible(part)
+		local cam = workspace.CurrentCamera
+		if not cam then return true end
+		rp.FilterDescendantsInstances = { LP.Character }
+		local origin = cam.CFrame.Position
+		local result = workspace:Raycast(origin, part.Position - origin, rp)
+		if not result then return true end
+		return result.Instance:IsDescendantOf(part.Parent)
+	end
+
+	local function laserBlocked(origin, targetPart)
+		local ignore = { LP.Character, targetPart.Parent }
+		local dir = targetPart.Position - origin
+		for _ = 1, 6 do
+			laserRay.FilterDescendantsInstances = ignore
+			local res = workspace:Raycast(origin, dir, laserRay)
+			if not res then return false end
+			local inst = res.Instance
+			if inst.CanCollide == false or inst.Transparency >= 0.95 then
+				ignore[#ignore + 1] = inst
+			else
+				return true
+			end
+		end
+		return true
+	end
+
+	local function updateLaser(origin, target)
+		if not (T.ShowLaser and origin and target) or laserBlocked(origin, target) then return hideLaser() end
+		if not (laserPart and laserPart.Parent) then
+			local p = Instance.new("Part")
+			p.Name = "KinonLaser"
+			p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+			p.Material = Enum.Material.Neon
+			p.Color = Color3.fromRGB(255, 60, 60)
+			p.Parent = workspace
+			laserPart = p
+		end
+		local to = target.Position
+		local dist = (to - origin).Magnitude
+		if dist < 0.5 then return hideLaser() end
+		laserPart.Size = Vector3.new(0.12, 0.12, dist)
+		laserPart.CFrame = CFrame.lookAt((origin + to) / 2, to)
+		laserPart.Transparency = 0.25
+	end
+
+	local function findButton()
+		local cur = LP:FindFirstChild("PlayerGui")
+		for seg in string.gmatch("Survivor-mob.Controls.Gui-mob", "[^%.]+") do
+			cur = cur and cur:FindFirstChild(seg)
+		end
+		return cur
+	end
+
+	local function closest()
+		local cam = workspace.CurrentCamera
+		if not cam then return nil end
+		local word = T.TargetMode == "Survivor" and "survivor" or "killer"
+		local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+		local best, shortest = nil, tonumber(T.FOV) or 250
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP and p.Character and p.Team and string.find(string.lower(p.Team.Name), word, 1, true) then
+				local part = p.Character:FindFirstChild("HumanoidRootPart")
+				local hum = p.Character:FindFirstChildOfClass("Humanoid")
+				if part and hum and hum.Health > 0 then
+					local pos, vis = cam:WorldToViewportPoint(part.Position)
+					if vis then
+						local d = (Vector2.new(pos.X, pos.Y) - center).Magnitude
+						if d < shortest and (not T.Vis or visible(part)) then
+							shortest = d
+							best = part
+						end
+					end
+				end
+			end
+		end
+		return best
+	end
+
+	local function step()
+		if unloaded or not T.Enabled then return end
+		if not holding then return hideLaser() end
+		local cam = workspace.CurrentCamera
+		local target = closest()
+		if not cam or not target then return hideLaser() end
+		local pos = target.Position + target.AssemblyLinearVelocity * ((tonumber(T.Predict) or 0) / 100)
+		local k = math.clamp((tonumber(T.Smooth) or 50) / 100, 0.05, 1)
+		cam.CFrame = cam.CFrame:Lerp(CFrame.new(cam.CFrame.Position, pos), k)
+		local char = LP.Character
+		local head = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
+		pcall(updateLaser, head and head.Position, target)
+	end
+
+	local function teardown()
+		token = token + 1
+		holding = false
+		for _, c in ipairs(conns) do c:Disconnect() end
+		for _, c in ipairs(btnConns) do c:Disconnect() end
+		conns, btnConns, curBtn = {}, {}, nil
+		if laserPart then pcall(function() laserPart:Destroy() end); laserPart = nil end
+	end
+
+	function obj:SetEnabled(v)
+		T.Enabled = v == true
+		teardown()
+		if not T.Enabled then return end
+		local my = token
+		conns[#conns + 1] = RunService.RenderStepped:Connect(function() pcall(step) end)
+		conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
+			if gp then return end
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then holding = true end
+		end)
+		conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then holding = false end
+		end)
+		task.spawn(function()
+			while token == my and not unloaded do
+				local btn = findButton()
+				if btn and btn ~= curBtn then
+					for _, c in ipairs(btnConns) do c:Disconnect() end
+					btnConns = {}
+					curBtn = btn
+					btnConns[#btnConns + 1] = btn.InputBegan:Connect(function(input)
+						if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton2 then
+							holding = true
+						end
+					end)
+					btnConns[#btnConns + 1] = btn.InputEnded:Connect(function(input)
+						if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton2 then
+							holding = false
+						end
+					end)
+				end
+				task.wait(1)
+			end
+		end)
+	end
+
+	function obj:Destroy()
+		T.Enabled = false
+		teardown()
+	end
+
+	return obj
+end)()
+
+Hooks.TOF = function(s)
+	State.TOFObj:SetEnabled(s.Enabled)
+end
+
+State.AimFlash = { Enabled = false, Range = 120, AimPart = "Head", Smooth = 35, ShowLaser = true }
+
+State.FlashObj = (function()
+	local FL = State.AimFlash
+	local obj = {}
+	local conn, laser
+	local active, flashPart = false, nil
+	local token = 0
+
+	local function holdingFlashlight()
+		local c = LP.Character
+		if not c then return false end
+		for _, t in ipairs(c:GetChildren()) do
+			if t:IsA("Tool") then
+				local n = string.lower(t.Name)
+				if string.find(n, "flash", 1, true) or string.find(n, "torch", 1, true) then return true end
+			end
+		end
+		return false
+	end
+
+	local function clearLaser()
+		if laser then pcall(function() laser:Destroy() end); laser = nil end
+	end
+
+	local function targetPart(char)
+		local p = char:FindFirstChild(FL.AimPart or "Head")
+		if p and p:IsA("BasePart") then return p end
+		return char:FindFirstChild("Head") or char:FindFirstChild("UpperTorso")
+			or char:FindFirstChild("Torso") or char:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function pickTarget(myPos)
+		local best, bestDist = nil, tonumber(FL.Range) or 120
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LP and plr.Character and plr.Team and string.find(string.lower(plr.Team.Name), "killer", 1, true) then
+				local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+				local part = targetPart(plr.Character)
+				if hum and hum.Health > 0 and plr.Character:GetAttribute("State") ~= "Dead" and part then
+					local d = (myPos - part.Position).Magnitude
+					if d <= bestDist then best, bestDist = part, d end
+				end
+			end
+		end
+		return best
+	end
+
+	local function laserOrigin(cam)
+		if typeof(flashPart) == "Instance" and flashPart.Parent then
+			if flashPart:IsA("BasePart") then return flashPart.Position end
+			local p = flashPart:FindFirstChildWhichIsA("BasePart", true)
+			if p then return p.Position end
+		end
+		local c = LP.Character
+		local hand = c and (c:FindFirstChild("RightHand") or c:FindFirstChild("Right Arm") or c:FindFirstChild("HumanoidRootPart"))
+		if hand and hand:IsA("BasePart") then return hand.Position end
+		return cam.CFrame.Position
+	end
+
+	local function updateLaser(op, tp)
+		if not (laser and laser.Parent) then
+			local l = Instance.new("Part")
+			l.Name = "VDFlashlightLaser"
+			l.Anchored, l.CanCollide, l.CanTouch, l.CanQuery, l.CastShadow = true, false, false, false, false
+			l.Material = Enum.Material.Neon
+			l.Color = Color3.fromRGB(255, 255, 255)
+			l.Parent = workspace
+			laser = l
+		end
+		local d = (tp - op).Magnitude
+		if d < 0.1 then return end
+		laser.Size = Vector3.new(0.16, 0.16, d)
+		laser.CFrame = CFrame.new((op + tp) / 2, tp)
+		laser.Transparency = 0.35
+	end
+
+	local function isActive()
+		if State.SpearObj and State.SpearObj.HookOk and State.FlashRemote then return active end
+		return holdingFlashlight()
+	end
+
+	local function step()
+		if unloaded or not FL.Enabled then return end
+		local c = LP.Character
+		local root = c and c:FindFirstChild("HumanoidRootPart")
+		local cam = workspace.CurrentCamera
+		if not root or not cam or not isActive() then
+			if laser then laser.Transparency = 1 end
+			return
+		end
+		local part = pickTarget(root.Position)
+		if not part then
+			if laser then laser.Transparency = 1 end
+			return
+		end
+		if FL.ShowLaser then
+			pcall(updateLaser, laserOrigin(cam), part.Position)
+		elseif laser then
+			laser.Transparency = 1
+		end
+		local k = math.clamp((tonumber(FL.Smooth) or 35) / 100, 0.05, 1)
+		cam.CFrame = cam.CFrame:Lerp(CFrame.new(cam.CFrame.Position, part.Position), k)
+		root.CFrame = CFrame.new(root.Position, Vector3.new(part.Position.X, root.Position.Y, part.Position.Z))
+	end
+
+	State.FlashSetActive = function(on, part)
+		active = on == true
+		flashPart = active and part or nil
+	end
+
+	function obj:SetEnabled(v)
+		FL.Enabled = v == true
+		if conn then conn:Disconnect(); conn = nil end
+		token = token + 1
+		active, flashPart = false, nil
+		clearLaser()
+		if FL.Enabled then
+			local my = token
+			conn = RunService.RenderStepped:Connect(function() pcall(step) end)
+			task.spawn(function()
+				for _ = 1, 40 do
+					if token ~= my or unloaded then return end
+					local r = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+					local i = r and r:FindFirstChild("Items")
+					local f = i and i:FindFirstChild("Flashlight")
+					local a = f and f:FindFirstChild("Activate")
+					if a and a:IsA("RemoteEvent") then
+						State.FlashRemote = a
+						return
+					end
+					task.wait(0.5)
+				end
+			end)
+		end
+	end
+
+	function obj:Destroy()
+		FL.Enabled = false
+		token = token + 1
+		if conn then conn:Disconnect(); conn = nil end
+		State.FlashRemote = nil
+		clearLaser()
+	end
+
+	return obj
+end)()
+
+Hooks.AimFlash = function(s)
+	State.FlashObj:SetEnabled(s.Enabled)
+end
+
+State.NoSlow = { K = false, S = false }
 
 State.Spear = State.SpearObj
 Hooks.Spear = function(s)
@@ -1667,6 +2034,7 @@ State.PumpkinFarmObj = (function()
 
 	task.spawn(function()
 		local shiftHeld, mobileTouched, lastTap = false, false, 0
+		local tapStreak, pauseUntil = 0, 0
 		while not unloaded do
 			task.wait(0.12)
 			local active = S.Enabled and S.AutoRun and not isSpectating()
@@ -1682,11 +2050,17 @@ State.PumpkinFarmObj = (function()
 					if mobile then
 						local moving, crouch, sprint = isMoving(), isCrouching(), isSprinting()
 						local now = tick()
-						if now - lastTap > 0.6 then
+						if sprint then tapStreak = 0 end
+						if now - lastTap > 0.6 and now > pauseUntil then
 							if crouch then
 								if sprint then tapSprint(); lastTap = now end
 							elseif not sprint then
 								tapSprint(); lastTap = now
+								tapStreak = tapStreak + 1
+								if tapStreak >= 4 then
+									tapStreak = 0
+									pauseUntil = now + 15
+								end
 							end
 						end
 						mobileTouched = true
@@ -2091,17 +2465,51 @@ State.SkillCheckObj = (function()
 		return minA <= lineRot and lineRot <= maxA
 	end
 
+	function Class:_safetyProgress()
+		local now = os.clock()
+		if now - (self._genScanAt or 0) > 6 then
+			self._genScanAt = now
+			local list = {}
+			local map = workspace:FindFirstChild("Map")
+			if map then
+				for _, d in ipairs(map:GetDescendants()) do
+					if d:IsA("Model") and string.lower(d.Name) == "generator" then
+						table.insert(list, d)
+					end
+				end
+			end
+			self._gens = list
+		end
+		local char = LP.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root then return 0 end
+		local best, bestDist = 0, 45
+		for _, g in ipairs(self._gens or {}) do
+			if g.Parent then
+				local part = g.PrimaryPart or g:FindFirstChildWhichIsA("BasePart")
+				if part then
+					local d = (part.Position - root.Position).Magnitude
+					if d < bestDist then
+						bestDist = d
+						best = tonumber(g:GetAttribute("RepairProgress")) or 0
+					end
+				end
+			end
+		end
+		return best
+	end
+
 	function Class:_shouldSnapInstant()
 		local m = self.Settings.Mode
 		if m == "Instant" then return true end
-		if m == "Random" and not self._randomModeIsNormal then return true end
+		if m == "Safety" then return self:_safetyProgress() < 90 end
 		return false
 	end
 
 	function Class:_shouldFireByRange(lineRot, goalRot)
 		local S = self.Settings
 		local m = S.Mode
-		if m == "Normal" or (m == "Random" and self._randomModeIsNormal) then
+		if m == "Normal" or m == "Safety" then
 			return self:_inAngleRange(lineRot, goalRot, S.NormalMinOffset, S.NormalMaxOffset)
 		end
 		return self:_inAngleRange(lineRot, goalRot, S.LegitMinOffset, S.LegitMaxOffset)
@@ -2161,11 +2569,7 @@ State.SkillCheckObj = (function()
 				if not start then return end
 
 				if self._kingConn then self._kingConn:Disconnect() end
-				self._kingConn = start.OnClientEvent:Connect(function()
-					if self.Settings.Mode == "Random" then
-						self._randomModeIsNormal = true
-					end
-				end)
+				self._kingConn = start.OnClientEvent:Connect(function() end)
 			end)
 		end)
 	end
@@ -2195,7 +2599,7 @@ State.SkillCheckObj = (function()
 	end
 
 	function Class:SetMode(mode)
-		local valid = { Legit = true, Instant = true, Normal = true, Random = true }
+		local valid = { Legit = true, Instant = true, Normal = true, Safety = true }
 		if not valid[mode] then return false end
 		self.Settings.Mode = mode
 		self._randomModeIsNormal = false
@@ -2591,100 +2995,122 @@ State.PerfObj = (function()
 		self._saved = {}
 	end
 
-	local TREE_WORDS  = { "tree", "pine", "oak", "birch", "spruce", "palm", "foliage", "leaves", "leaf", "bush", "shrub", "canopy", "trunk", "stump", "bark", "branch", "willow", "maple", "cedar", "cypress", "aspen", "acacia", "bamboo", "log", "timber", "forest" }
-	local GRASS_WORDS = { "grass", "weed", "fern", "flower", "reed", "clover", "plant", "herb", "moss", "vegetation", "meadow" }
+	local TREE_PATTERNS = {
+		"%f[%a]trees?%f[%A]", "%f[%a]bush", "%f[%a]shrub", "%f[%a]foliage", "%f[%a]leaf", "%f[%a]leaves",
+		"%f[%a]trunk", "%f[%a]branch", "%f[%a]stump", "%f[%a]pine", "%f[%a]oak", "%f[%a]birch",
+		"%f[%a]spruce", "%f[%a]palm", "%f[%a]bamboo", "%f[%a]hedge", "%f[%a]cypress", "%f[%a]willow",
+		"%f[%a]forest", "%f[%a]twig", "%f[%a]sapling", "%f[%a]canopy", "%f[%a]maple", "%f[%a]cedar",
+	}
+	local GRASS_PATTERNS = {
+		"%f[%a]grass", "%f[%a]weeds?%f[%A]", "%f[%a]fern", "%f[%a]plants?%f[%A]", "%f[%a]vines?%f[%A]",
+		"%f[%a]flowers?%f[%A]", "%f[%a]reeds?%f[%A]", "%f[%a]vegetation", "%f[%a]moss", "%f[%a]clover",
+		"%f[%a]meadow",
+	}
+	local EXCLUDE_WORDS = {
+		"generator", "pallet", "hook", "gate", "window", "vault", "exit", "chest", "locker", "door",
+		"rock", "stone", "boulder", "crate", "barrel", "box", "brick", "wall", "fence", "street",
+		"house", "home", "cabin", "building", "shed", "barn", "hut", "tent", "shack", "church", "roof",
+		"floor", "stair", "porch", "basement", "garage", "bunker", "tower", "bridge",
+		"temple", "mansion", "hospital", "school", "factory", "warehouse",
+	}
 
-	function Class:_keywords()
+	local function matchPatterns(name, list)
+		local n = string.lower(name)
+		for _, pat in ipairs(list) do
+			if string.find(n, pat) then return true end
+		end
+		return false
+	end
+
+	local function matchPlain(name, list)
+		local n = string.lower(name)
+		for _, w in ipairs(list) do
+			if string.find(n, w, 1, true) then return true end
+		end
+		return false
+	end
+
+	local function nameHit(self, name)
+		return matchPatterns(name, self._tgPatterns) or matchPlain(name, self._tgCustom)
+	end
+
+	local function treeModel(self, m)
+		local cache = self._tgCache
+		local c = cache[m]
+		if c == true then return true end
+		if c and os.clock() < c then return false end
+		local res = false
+		if nameHit(self, m.Name) then
+			res = true
+		else
+			local okSize, ext = pcall(function() return m:GetExtentsSize() end)
+			if okSize and ext.Magnitude < 70 then
+				local kids = m:GetChildren()
+				local total, hits = math.min(#kids, 80), 0
+				for i = 1, total do
+					local kid = kids[i]
+					if nameHit(self, kid.Name)
+						or (kid:IsA("BasePart") and kid.Material == Enum.Material.LeafyGrass) then
+						hits = hits + 1
+					end
+				end
+				if total > 0 and hits >= math.max(1, math.floor(total * 0.3)) then res = true end
+			end
+		end
+		cache[m] = res and true or (os.clock() + 3)
+		return res
+	end
+
+	local function isFoliage(self, inst)
+		local hit = false
+		local cur, depth = inst, 0
+		while cur and cur ~= workspace and depth < 10 do
+			if cur:IsA("Model") then
+				if cur:FindFirstChildOfClass("Humanoid") then return false end
+				if treeModel(self, cur) then hit = true end
+			end
+			if cur:IsA("Model") or cur == inst then
+				if matchPlain(cur.Name, EXCLUDE_WORDS) then return false end
+			end
+			if nameHit(self, cur.Name) then hit = true end
+			cur = cur.Parent
+			depth = depth + 1
+		end
+		return hit
+	end
+
+	local function hideInst(self, inst)
+		local saved = self._tgSaved
+		if saved[inst] then return end
 		local S = self.Settings
-		local list = {}
-		if S.RemoveTree then
-			for _, w in ipairs(TREE_WORDS) do table.insert(list, w) end
-		end
-		if S.RemoveGrass then
-			for _, w in ipairs(GRASS_WORDS) do table.insert(list, w) end
-		end
-		if #list > 0 then
-			for part in string.gmatch(string.lower(S.Keywords or ""), "[^,]+") do
-				local word = part:match("^%s*(.-)%s*$")
-				if word ~= "" then table.insert(list, word) end
+		if inst:IsA("BasePart") then
+			if inst:IsA("Terrain") then return end
+			local sz = inst.Size
+			if math.max(sz.X, sz.Z) > 45 and not nameHit(self, inst.Name) then return end
+			if S.RemoveGrass and inst.Material == Enum.Material.Grass then
+				saved[inst] = { kind = "mat", m = inst.Material }
+				inst.Material = Enum.Material.Ground
+				return
 			end
-		end
-		return list
-	end
-
-	local function nameMatches(name, keywords)
-		local lower = string.lower(name)
-		if string.find(lower, "street", 1, true) then return false end
-		for _, kw in ipairs(keywords) do
-			if string.find(lower, kw, 1, true) then return true end
-		end
-		return false
-	end
-
-	local function isCharacterPart(obj)
-		local model = obj:IsA("Model") and obj or obj:FindFirstAncestorOfClass("Model")
-		if not model then return false end
-		return Players:GetPlayerFromCharacter(model) ~= nil
-			or model:FindFirstChildOfClass("Humanoid") ~= nil
-	end
-
-	local function removable(o)
-		return o:IsA("Model") or o:IsA("Folder") or o:IsA("BasePart")
-	end
-
-	local SHAPE_SKIP = { "wall", "door", "gate", "fence", "pillar", "pole", "lamp", "light", "post", "pallet", "window", "stair", "ladder", "generator", "hook", "locker", "exit", "street", "bridge", "tower", "chimney", "column" }
-
-	local function shapeLooksLikeTree(d)
-		if not d:IsA("BasePart") or d:IsA("Terrain") or not d.CanCollide then return false end
-		local z = d.Size
-		local w = math.max(z.X, z.Z)
-		if z.Y < 14 or w > 10 or z.Y / math.max(w, 0.1) < 2.5 then return false end
-		local lower = string.lower(d.Name)
-		for _, w2 in ipairs(SHAPE_SKIP) do
-			if string.find(lower, w2, 1, true) then return false end
-		end
-		return true
-	end
-
-	local function hasHiddenAncestor(self, d)
-		local p = d.Parent
-		while p and p ~= workspace do
-			if self._hiddenSet[p] then return true end
-			p = p.Parent
-		end
-		return false
-	end
-
-	function Class:_removeObj(obj)
-		if self._hiddenSet[obj] or hasHiddenAncestor(self, obj) then return end
-		local rec = { obj = obj, props = {} }
-		self._hiddenSet[obj] = rec
-		table.insert(self._hidden, rec)
-		local function strip(p)
-			if rec.props[p] then return end
-			if p:IsA("BasePart") then
-				rec.props[p] = { CanCollide = p.CanCollide, CanQuery = p.CanQuery, CanTouch = p.CanTouch, Transparency = p.Transparency }
-				p.CanCollide, p.CanQuery, p.CanTouch, p.Transparency = false, false, false, 1
-			elseif p:IsA("Decal") or p:IsA("Texture") then
-				rec.props[p] = { Transparency = p.Transparency }
-				p.Transparency = 1
-			elseif p:IsA("ParticleEmitter") then
-				rec.props[p] = { Enabled = p.Enabled }
-				p.Enabled = false
-			end
-		end
-		pcall(strip, obj)
-		for _, d in ipairs(obj:GetDescendants()) do pcall(strip, d) end
-		rec.conn = obj.DescendantAdded:Connect(function(d)
-			if self._removeActive then pcall(strip, d) end
-		end)
-	end
-
-	function Class:_checkNew(d, gen, kws)
-		if gen ~= self._removeGen or not self._removeActive then return end
-		if not removable(d) or self._hiddenSet[d] or not d.Parent or hasHiddenAncestor(self, d) then return end
-		if (nameMatches(d.Name, kws) or (self.Settings.RemoveTree and shapeLooksLikeTree(d))) and not isCharacterPart(d) then
-			self:_removeObj(d)
+			local leafy = inst.Material == Enum.Material.LeafyGrass and (S.RemoveGrass or S.RemoveTree)
+			if not (leafy or isFoliage(self, inst)) then return end
+			saved[inst] = {
+				kind = "part", t = inst.Transparency, cs = inst.CastShadow,
+				cc = inst.CanCollide, cq = inst.CanQuery, ct = inst.CanTouch,
+			}
+			inst.Transparency = 1
+			inst.CastShadow = false
+			inst.CanCollide = false
+			inst.CanQuery = false
+			inst.CanTouch = false
+		elseif inst:IsA("Decal") or inst:IsA("Texture") then
+			if not isFoliage(self, inst) then return end
+			saved[inst] = { kind = "decal", t = inst.Transparency }
+			inst.Transparency = 1
+		elseif inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Trail") then
+			if not isFoliage(self, inst) then return end
+			saved[inst] = { kind = "fx", e = inst.Enabled }
+			inst.Enabled = false
 		end
 	end
 
@@ -2710,27 +3136,39 @@ State.PerfObj = (function()
 	end
 
 	function Class:_scanRemove(gen)
-		local keywords = self:_keywords()
-		if #keywords == 0 then return end
-		local desc = workspace:GetDescendants()
-		for i, d in ipairs(desc) do
-			if i % 3000 == 0 then
+		local list = workspace:GetDescendants()
+		local t0 = os.clock()
+		for _, inst in ipairs(list) do
+			if gen ~= self._removeGen or not self._removeActive or unloaded then return end
+			pcall(hideInst, self, inst)
+			if os.clock() - t0 > 0.004 then
 				task.wait()
-				if gen ~= self._removeGen or not self.Settings.Enabled then return end
-			end
-			if removable(d) and not self._hiddenSet[d] and d:IsDescendantOf(workspace)
-				and not hasHiddenAncestor(self, d)
-				and (nameMatches(d.Name, keywords) or (self.Settings.RemoveTree and shapeLooksLikeTree(d)))
-				and not isCharacterPart(d) then
-				self:_removeObj(d)
+				t0 = os.clock()
 			end
 		end
 	end
 
 	function Class:_applyRemove()
-		local keywords = self:_keywords()
-		self:_setTerrainGrassHidden(self.Settings.RemoveGrass == true)
-		if #keywords == 0 then
+		local S = self.Settings
+		local patterns = {}
+		if S.RemoveTree then
+			for _, p in ipairs(TREE_PATTERNS) do table.insert(patterns, p) end
+		end
+		if S.RemoveGrass then
+			for _, p in ipairs(GRASS_PATTERNS) do table.insert(patterns, p) end
+		end
+		local custom = {}
+		if #patterns > 0 then
+			for part in string.gmatch(string.lower(S.Keywords or ""), "[^,]+") do
+				local word = part:match("^%s*(.-)%s*$")
+				if word ~= "" then table.insert(custom, word) end
+			end
+		end
+		self._tgPatterns, self._tgCustom = patterns, custom
+		self._tgCache = setmetatable({}, { __mode = "k" })
+		self._tgSaved = self._tgSaved or {}
+		self:_setTerrainGrassHidden(S.RemoveGrass == true)
+		if #patterns == 0 then
 			self._removeActive = false
 			return
 		end
@@ -2740,18 +3178,18 @@ State.PerfObj = (function()
 		local gen = self._removeGen
 
 		if self._removeConn then self._removeConn:Disconnect() end
-		local kws = keywords
 		self._removeConn = workspace.DescendantAdded:Connect(function(d)
-			if not self.Settings.Enabled then return end
-			self:_checkNew(d, gen, kws)
+			if self._removeActive and gen == self._removeGen then
+				pcall(hideInst, self, d)
+			end
 		end)
 
 		task.spawn(function()
 			local round = 0
-			while self.Settings.Enabled and gen == self._removeGen and not unloaded do
+			while S.Enabled and gen == self._removeGen and not unloaded do
 				task.wait(2)
 				if gen ~= self._removeGen then break end
-				if self.Settings.RemoveGrass then self:_setTerrainGrassHidden(true) end
+				if S.RemoveGrass then self:_setTerrainGrassHidden(true) end
 				round = round + 1
 				if round % 3 == 0 then self:_scanRemove(gen) end
 			end
@@ -2763,21 +3201,29 @@ State.PerfObj = (function()
 	function Class:_restoreRemove()
 		self._removeActive = false
 		self._removeGen = (self._removeGen or 0) + 1
-		self:_setTerrainGrassHidden(false)
 		if self._removeConn then
 			self._removeConn:Disconnect()
 			self._removeConn = nil
 		end
-		for _, rec in ipairs(self._hidden) do
-			if rec.conn then rec.conn:Disconnect(); rec.conn = nil end
-			for p, t in pairs(rec.props or {}) do
-				for k, v in pairs(t) do
-					pcall(function() p[k] = v end)
+		for inst, o in pairs(self._tgSaved or {}) do
+			pcall(function()
+				if o.kind == "part" then
+					inst.Transparency = o.t
+					inst.CastShadow = o.cs
+					inst.CanCollide = o.cc
+					inst.CanQuery = o.cq
+					inst.CanTouch = o.ct
+				elseif o.kind == "mat" then
+					inst.Material = o.m
+				elseif o.kind == "decal" then
+					inst.Transparency = o.t
+				elseif o.kind == "fx" then
+					inst.Enabled = o.e
 				end
-			end
+			end)
 		end
-		self._hidden = {}
-		self._hiddenSet = {}
+		self._tgSaved = {}
+		self:_setTerrainGrassHidden(false)
 	end
 
 	function Class:Refresh()
@@ -2973,14 +3419,41 @@ local function KINON_ShouldPassFaceCheck(killerRoot, playerRoot)
 	if not killerRoot or not playerRoot then
 		return false
 	end
-	local offset = playerRoot.Position - killerRoot.Position
-	if offset.Magnitude <= 0.001 then
+	local memo = Parry.FaceMemo
+	if not memo then
+		memo = setmetatable({}, { __mode = "k" })
+		Parry.FaceMemo = memo
+	end
+	local now = os.clock()
+	if memo[killerRoot] and now - memo[killerRoot] < 0.6 then
 		return true
 	end
+	local offset = playerRoot.Position - killerRoot.Position
+	local dist = offset.Magnitude
+	if dist <= 6 then
+		return true
+	end
+	local dir = offset.Unit
 	local sensitivity = math.clamp(tonumber(Parry.FaceSensitivity) or 10, 0, 10) / 10
-	local maxAngle = 15 + (sensitivity * 75)
-	local facingDot = killerRoot.CFrame.LookVector:Dot(offset.Unit)
-	return facingDot >= math.cos(math.rad(maxAngle))
+	local maxAngle = 20 + sensitivity * 100
+	local cosLimit = math.cos(math.rad(maxAngle))
+	local passed = killerRoot.CFrame.LookVector:Dot(dir) >= cosLimit
+	if not passed then
+		local model = killerRoot.Parent
+		local head = model and model:FindFirstChild("Head")
+		if head and head:IsA("BasePart") and head.CFrame.LookVector:Dot(dir) >= cosLimit then
+			passed = true
+		end
+	end
+	if not passed then
+		local vel = killerRoot.AssemblyLinearVelocity
+		if vel and vel.Magnitude > 8 then
+			local velLimit = math.cos(math.rad(math.min(maxAngle + 20, 150)))
+			if vel.Unit:Dot(dir) >= velLimit then passed = true end
+		end
+	end
+	if passed then memo[killerRoot] = now end
+	return passed
 end
 
 local function CreateCustomParryGUI()
@@ -3448,11 +3921,27 @@ local function KINON_PreserveFacingAtParry()
 	if not root or not humanoid then return nil end
 	local originalAutoRotate = humanoid.AutoRotate
 	pcall(function() humanoid.AutoRotate = false end)
+	local lockRotation = root.CFrame.Rotation
+	local lockConn
+	if Parry.KeepFacing ~= false then
+		lockConn = RunService.Heartbeat:Connect(function()
+			if not root.Parent or unloaded then return end
+			pcall(function()
+				root.CFrame = CFrame.new(root.Position) * lockRotation
+				root.AssemblyAngularVelocity = Vector3.zero
+			end)
+		end)
+	end
+	local function stopLock()
+		if lockConn then lockConn:Disconnect(); lockConn = nil end
+	end
+	task.delay(1.2, stopLock)
 	local restored = false
 	return function(_parrySucceeded)
 		if restored then return end
 		restored = true
-		task.delay(0.04, function()
+		task.delay(Parry.KeepFacing ~= false and 0.4 or 0.04, function()
+			stopLock()
 			if humanoid and humanoid.Parent and character == LP.Character then
 				pcall(function() humanoid.AutoRotate = originalAutoRotate end)
 			end
@@ -4220,6 +4709,7 @@ local function addDropdown(card, label, iconName, values, fmt, get, set)
 		Font = Enum.Font.GothamBold,
 		TextSize = 12,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 	}, btn)
 	local arrow = icon("chevron-down", 14, C.Muted, btn, {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -4240,6 +4730,7 @@ local function addDropdown(card, label, iconName, values, fmt, get, set)
 		local w = btn.AbsoluteSize.X / sc
 		local h = #values * itemH + (#values - 1) * 2 + pad * 2
 		local vp = Gui.AbsoluteSize
+		h = math.min(h, math.max(120, math.floor(vp.Y / sc * 0.5)))
 		local pos = btn.AbsolutePosition
 		local below = pos.Y + btn.AbsoluteSize.Y + 4 + h * sc <= vp.Y - 8
 
@@ -4258,11 +4749,16 @@ local function addDropdown(card, label, iconName, values, fmt, get, set)
 			Size = UDim2.fromOffset(0, 0),
 			BackgroundTransparency = 1,
 		}, blocker)
-		local popup = new("Frame", {
+		local popup = new("ScrollingFrame", {
 			AnchorPoint = Vector2.new(0, below and 0 or 1),
 			Size = UDim2.fromOffset(w, 0),
 			BackgroundColor3 = C.Card,
+			BorderSizePixel = 0,
 			ClipsDescendants = true,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 3,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
 		}, anchor)
 		new("UIScale", { Scale = sc }, popup)
 		corner(popup, 8)
@@ -4578,9 +5074,21 @@ local function addSwatches(card, label, iconName, _colors, get, set)
 	attachColorPicker(ctrl, get, set, 24, 1)
 end
 
-local function addCheckbox(card, label, iconName, get, set, colorGet, colorSet)
-	local ctrl, rowBtn = addOption(card, label, iconName, colorGet and 64 or true)
+local function addCheckbox(card, label, iconName, get, set, colorGet, colorSet, roleTag)
+	local ctrl, rowBtn = addOption(card, label, iconName, roleTag and 84 or (colorGet and 64 or true))
 	if colorGet then attachColorPicker(ctrl, colorGet, colorSet, 24, -1) end
+	if roleTag then
+		local tag = new("TextLabel", {
+			Size = UDim2.fromOffset(56, 22),
+			BackgroundColor3 = C.Surface,
+			Text = string.upper(roleTag),
+			TextColor3 = C.Text,
+			Font = Enum.Font.GothamBold,
+			TextSize = 10,
+			LayoutOrder = -2,
+		}, ctrl)
+		corner(tag, 6)
+	end
 
 	local box = new("TextButton", {
 		Size = UDim2.fromOffset(22, 22),
@@ -4686,7 +5194,7 @@ do
 	local card = addCard(0, "target", "Auto Skill Check", "", "SkillCheck")
 	local function sync() card.sub.Text = "Mode: " .. s.Mode end
 	sync()
-	addDropdown(card, "Mode", "list", { "Legit", "Instant", "Normal", "Random" },
+	addDropdown(card, "Mode", "list", { "Legit", "Instant", "Normal", "Safety" },
 		function(v) return v end,
 		function() return s.Mode end,
 		function(v) obj:SetMode(v); sync() end)
@@ -4760,6 +5268,10 @@ do
 		function() return s.AggressiveMode end,
 		function(v) s.AggressiveMode = v end)
 
+	addCheckbox(card, "Keep Facing (no turn)", "compass",
+		function() return s.KeepFacing ~= false end,
+		function(v) s.KeepFacing = v end)
+
 	addCheckbox(card, "Button Parry", "mouse-pointer-click",
 		function() return FloatingParryButtonEnabled end,
 		function(v)
@@ -4830,6 +5342,843 @@ do
 	opt("Outline ESP",     "scan",       "HLOutline")
 end
 
+State.Utilities = {
+	Enabled = true,
+	AntiBlindFlashlightK = false, DashLockK = false, AimlockAttackK = false, NoSlowDown = false,
+	PalletReflexS = false,
+	AlwaysFastVaultS = false, UnlimitedVaultS = false,
+	DashRadius = 50, AimRadius = 50,
+}
+State.UtilityHandlers = {}
+Hooks.Utilities = function(s)
+	for key, handler in pairs(State.UtilityHandlers) do
+		pcall(handler, s.Enabled and s[key] == true)
+	end
+end
+
+do
+	local Lighting = game:GetService("Lighting")
+	local RunService = game:GetService("RunService")
+	local ENV = getgenv and getgenv() or _G
+	ENV.VD = ENV.VD or {}
+	State.AntiBlindOn = false
+	local hb
+	local saved = {}
+
+	State.IsKillerNow = function()
+		local char = LP.Character
+		if not char then return false end
+		if LP.Team and string.find(string.lower(LP.Team.Name), "killer", 1, true) then return true end
+		if char:GetAttribute("MorphedKiller") then return true end
+		return false
+	end
+
+	local function remember(inst, prop)
+		saved[#saved + 1] = { inst, prop, inst[prop] }
+	end
+
+	local function clearVisuals()
+		if not State.AntiBlindOn or not State.IsKillerNow() then return end
+		for _, child in ipairs(Lighting:GetChildren()) do
+			if child:IsA("BlurEffect") then
+				if child.Enabled or child.Size ~= 0 then
+					remember(child, "Enabled"); remember(child, "Size")
+					child.Size = 0
+					child.Enabled = false
+				end
+			elseif child:IsA("ColorCorrectionEffect") then
+				if child.Enabled and (child.Brightness < -0.2 or child.Contrast > 0.5) then
+					remember(child, "Enabled")
+					child.Enabled = false
+				end
+			end
+		end
+		local pg = LP:FindFirstChild("PlayerGui")
+		if pg then
+			for _, gui in ipairs(pg:GetChildren()) do
+				if gui:IsA("ScreenGui") and gui.Enabled then
+					local n = string.lower(gui.Name)
+					if n:find("blind", 1, true) or n:find("flash", 1, true) then
+						remember(gui, "Enabled")
+						gui.Enabled = false
+					end
+				end
+			end
+		end
+	end
+
+	State.UtilityHandlers.AntiBlindFlashlightK = function(on)
+		State.AntiBlindOn = on == true
+		ENV.VD.KILLER_AntiBlind = State.AntiBlindOn
+		if hb then hb:Disconnect(); hb = nil end
+		if State.AntiBlindOn then
+			hb = RunService.Heartbeat:Connect(clearVisuals)
+		else
+			for i = #saved, 1, -1 do
+				local e = saved[i]
+				pcall(function() e[1][e[2]] = e[3] end)
+			end
+			saved = {}
+		end
+	end
+end
+do
+	local ENV = getgenv and getgenv() or _G
+	ENV.VD = ENV.VD or {}
+	ENV.VD.NoFallDamage = false
+	local function sync()
+		ENV.VD.NoFallDamage = (State.NoSlow.K or State.NoSlow.S) and true or false
+	end
+	State.UtilityHandlers.NoSlowDown = function(on)
+		State.NoSlow.K = on == true
+		State.NoSlow.S = on == true
+		sync()
+	end
+end
+
+do
+	local AlwaysFastVaultEnabled = false
+
+	local function InstallAlwaysFastVaultHooks()
+		local rs = game:GetService("ReplicatedStorage")
+		pcall(function()
+			local module = require(rs:WaitForChild("Modules"):WaitForChild("Survivors"):WaitForChild("SurvivorVault"))
+			if module and type(module.evaluate) == "function" and not module._VDFastVaultHooked then
+				module._VDOriginalEvaluate = module.evaluate
+				module.evaluate = function(self, ...)
+					if AlwaysFastVaultEnabled then
+						return true, "ready", 5
+					end
+					return module._VDOriginalEvaluate(self, ...)
+				end
+				module._VDFastVaultHooked = true
+			end
+		end)
+		pcall(function()
+			local module = require(rs:WaitForChild("Modules"):WaitForChild("Survivors"):WaitForChild("SurvivorAnimationsController"))
+			if module and type(module._validateFastVault) == "function" and not module._VDFastVaultHooked then
+				module._VDOriginalValidateFastVault = module._validateFastVault
+				module._validateFastVault = function(self, ...)
+					if AlwaysFastVaultEnabled then
+						return true, "ready", 5
+					end
+					return module._VDOriginalValidateFastVault(self, ...)
+				end
+				module._VDFastVaultHooked = true
+			end
+		end)
+	end
+
+	local fvConn
+	local function runInstall()
+		task.spawn(function()
+			for _ = 1, 20 do
+				if unloaded or not AlwaysFastVaultEnabled then break end
+				InstallAlwaysFastVaultHooks()
+				task.wait(0.25)
+			end
+		end)
+	end
+	State.UtilityHandlers.AlwaysFastVaultS = function(state)
+		AlwaysFastVaultEnabled = state and true or false
+		if fvConn then fvConn:Disconnect(); fvConn = nil end
+		if AlwaysFastVaultEnabled then
+			runInstall()
+			fvConn = LP.CharacterAdded:Connect(runInstall)
+		end
+	end
+end
+
+do
+	local CollectionService = game:GetService("CollectionService")
+	local UnlimitedVaultEnabled = false
+	local UnlimitedVaultConn = nil
+
+	local function EnableUnlimitedVault()
+		if UnlimitedVaultEnabled then return end
+		UnlimitedVaultEnabled = true
+		if UnlimitedVaultConn then UnlimitedVaultConn:Disconnect() end
+
+		for _, v in ipairs(CollectionService:GetTagged("Blocked")) do
+			CollectionService:RemoveTag(v, "Blocked")
+		end
+
+		UnlimitedVaultConn = CollectionService:GetInstanceAddedSignal("Blocked"):Connect(function(instance)
+			CollectionService:RemoveTag(instance, "Blocked")
+		end)
+	end
+
+	local function DisableUnlimitedVault()
+		UnlimitedVaultEnabled = false
+		if UnlimitedVaultConn then
+			UnlimitedVaultConn:Disconnect()
+			UnlimitedVaultConn = nil
+		end
+	end
+
+	State.UtilityHandlers.UnlimitedVaultS = function(state)
+		if state then EnableUnlimitedVault() else DisableUnlimitedVault() end
+	end
+end
+do
+	local U = State.Utilities
+	local DASH_ANIM = "rbxassetid://98163597193511"
+	local flags = { dash = false, aim = false }
+	local conn, charConn, animConn, guiConn
+	local dashActive = false
+	local attackInput, attackAt, tapUntil = nil, 0, 0
+	local dashTarget, aimTarget
+	local guiHooked = false
+
+	local function isSurvivor(p)
+		local t = p and p.Team and p.Team.Name
+		return t ~= nil and string.find(string.lower(t), "survivor", 1, true) ~= nil
+	end
+
+	local function myRoot()
+		local c = LP.Character
+		return c and c:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function hooked(ch)
+		return ch:GetAttribute("IsHooked") == true or ch:GetAttribute("State") == "Hooked"
+	end
+
+	local function closestWithin(radius)
+		local root = myRoot()
+		if not root then return nil end
+		local best, bestDist = nil, radius
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LP and isSurvivor(plr) and plr.Character then
+				local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+				local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+				if hum and hrp and hum.Health > 30 and not hooked(plr.Character) then
+					local d = (hrp.Position - root.Position).Magnitude
+					if d <= bestDist then best, bestDist = hrp, d end
+				end
+			end
+		end
+		return best
+	end
+
+	local function targetValid(part, radius)
+		if not part or not part.Parent then return false end
+		local ch = part.Parent
+		local hum = ch:FindFirstChildOfClass("Humanoid")
+		local root = myRoot()
+		if not hum or not root or hum.Health <= 30 or hooked(ch) then return false end
+		return (part.Position - root.Position).Magnitude <= radius
+	end
+
+	local function hookDashChar(char)
+		task.spawn(function()
+			local hum = char:WaitForChild("Humanoid", 5)
+			local animator = hum and hum:WaitForChild("Animator", 5)
+			if not animator or unloaded then return end
+			if animConn then animConn:Disconnect() end
+			animConn = animator.AnimationPlayed:Connect(function(track)
+				local id = track.Animation and track.Animation.AnimationId
+				if id == DASH_ANIM and flags.dash then
+					dashActive = true
+					track.Stopped:Connect(function() dashActive = false end)
+					task.delay(1.5, function() dashActive = false end)
+				end
+			end)
+		end)
+	end
+
+	local function hookAttackButton(obj)
+		if not obj:IsA("GuiButton") then return end
+		if obj:IsDescendantOf(Gui) then return end
+		local n = string.lower(obj.Name)
+		if string.find(n, "attack", 1, true) or string.find(n, "hit", 1, true)
+			or string.find(n, "slash", 1, true) or string.find(n, "swing", 1, true) then
+			obj.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.Touch
+					or input.UserInputType == Enum.UserInputType.MouseButton1 then
+					attackInput, attackAt = input, os.clock()
+				end
+			end)
+			obj.TouchTap:Connect(function() tapUntil = os.clock() + 0.25 end)
+		end
+	end
+
+	local function attackHeld()
+		if attackInput then
+			local st = attackInput.UserInputState
+			if st == Enum.UserInputState.End or st == Enum.UserInputState.Cancel or os.clock() - attackAt > 8 then
+				attackInput = nil
+			else
+				return true
+			end
+		end
+		return os.clock() < tapUntil
+	end
+
+	local function step()
+		if unloaded then return end
+		local cam = workspace.CurrentCamera
+		if not cam then return end
+		if flags.dash and dashActive then
+			local radius = tonumber(U.DashRadius) or 50
+			if not targetValid(dashTarget, radius * 1.3) then dashTarget = closestWithin(radius) end
+			if dashTarget then cam.CFrame = CFrame.new(cam.CFrame.Position, dashTarget.Position) end
+		else
+			dashTarget = nil
+		end
+		if flags.aim and LP.Team and LP.Team.Name == "Killer" and attackHeld() then
+			local radius = tonumber(U.AimRadius) or 50
+			if not targetValid(aimTarget, radius * 1.3) then aimTarget = closestWithin(radius) end
+			if aimTarget then cam.CFrame = CFrame.new(cam.CFrame.Position, aimTarget.Position) end
+		else
+			aimTarget = nil
+		end
+	end
+
+	local function sync()
+		local need = flags.dash or flags.aim
+		if need and not conn then
+			conn = RunService.RenderStepped:Connect(function() pcall(step) end)
+			if LP.Character then hookDashChar(LP.Character) end
+			charConn = LP.CharacterAdded:Connect(hookDashChar)
+			if not guiHooked then
+				guiHooked = true
+				task.spawn(function()
+					local pg = LP:WaitForChild("PlayerGui", 10)
+					if not pg then return end
+					for _, d in ipairs(pg:GetDescendants()) do pcall(hookAttackButton, d) end
+					guiConn = pg.DescendantAdded:Connect(function(d) pcall(hookAttackButton, d) end)
+				end)
+			end
+		elseif not need and conn then
+			conn:Disconnect(); conn = nil
+			if charConn then charConn:Disconnect(); charConn = nil end
+			if animConn then animConn:Disconnect(); animConn = nil end
+			if guiConn then guiConn:Disconnect(); guiConn = nil end
+			guiHooked = false
+			dashActive, dashTarget, aimTarget = false, nil, nil
+		end
+	end
+
+	State.UtilityHandlers.DashLockK = function(on)
+		flags.dash = on == true
+		if not flags.dash then dashActive = false end
+		sync()
+	end
+	State.UtilityHandlers.AimlockAttackK = function(on)
+		flags.aim = on == true
+		if not flags.aim then aimTarget, attackInput, tapUntil = nil, nil, 0 end
+		sync()
+	end
+end
+
+do
+	local RunService = game:GetService("RunService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local ENV = getgenv and getgenv() or _G
+	ENV.VD = ENV.VD or {}
+	local PR = { on = false, used = {}, lastScan = 0, lastDrop = 0, cache = {}, cacheAt = 0 }
+	State.PalletDist = 20
+	local hb, charConn
+
+	local function isSurvivor()
+		local team = LP.Team
+		return team ~= nil and (team.Name == "Survivors" or team.Name == "Survivor")
+	end
+
+	local function killerRoot()
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LP and plr.Character and plr.Team and string.find(string.lower(plr.Team.Name), "killer", 1, true) then
+				local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+				if hrp then return hrp end
+			end
+		end
+		return nil
+	end
+
+	local function pallets()
+		local now = os.clock()
+		if now - PR.cacheAt < 1 then return PR.cache end
+		PR.cacheAt = now
+		local list = {}
+		local map = workspace:FindFirstChild("Map")
+		if map then
+			for _, obj in ipairs(map:GetDescendants()) do
+				if obj.Name == "Palletwrong" and (obj:IsA("Model") or obj:IsA("Folder")) then
+					list[#list + 1] = obj
+				end
+			end
+		end
+		PR.cache = list
+		return list
+	end
+
+	local function isDropped(m)
+		if not m or not m.Parent then return true end
+		if PR.used[m] then return true end
+		local ok1, d = pcall(function() return m:GetAttribute("Destroyed") end)
+		if ok1 and d == true then return true end
+		local ok2, b = pcall(function() return m:GetAttribute("Broken") end)
+		if ok2 and b == true then return true end
+		if not m:FindFirstChildWhichIsA("BasePart", true) then return true end
+		return false
+	end
+
+	local function slidePoint(m)
+		local sp = m:FindFirstChild("PalletPointSlide")
+		if sp then return sp end
+		for _, c in ipairs(m:GetDescendants()) do
+			if c.Name == "PalletPointSlide" then return c end
+		end
+		return m:FindFirstChild("PalletPoint")
+	end
+
+	local function dropEvent()
+		local r = ReplicatedStorage:FindFirstChild("Remotes")
+		local f = r and r:FindFirstChild("Pallet")
+		return f and f:FindFirstChild("PalletDropEvent")
+	end
+
+	local function step()
+		if not PR.on or not isSurvivor() then return end
+		local now = os.clock()
+		if now - PR.lastScan < 0.2 then return end
+		PR.lastScan = now
+		if now - PR.lastDrop < 2.5 then return end
+		pcall(function()
+			local char = LP.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if not root or not hum or hum.Health <= 0 then return end
+			local k = killerRoot()
+			if not k then return end
+			if (root.Position - k.Position).Magnitude > State.PalletDist then return end
+			local ev = dropEvent()
+			if not ev then return end
+			local best, bestD = nil, 8
+			for _, pal in ipairs(pallets()) do
+				if not isDropped(pal) then
+					local ref = pal:FindFirstChild("PalletPoint") or pal:FindFirstChild("PalletPointSlide") or pal:FindFirstChildWhichIsA("BasePart", true)
+					if ref then
+						local d = (root.Position - ref.Position).Magnitude
+						if d < bestD then bestD = d; best = pal end
+					end
+				end
+			end
+			if best then
+				local target = slidePoint(best)
+				if target then
+					pcall(function() ev:FireServer(target) end)
+					PR.used[best] = true
+					PR.lastDrop = os.clock()
+				end
+			end
+		end)
+	end
+
+	State.UtilityHandlers.PalletReflexS = function(on)
+		PR.on = on == true
+		ENV.VD.PalletReflex = PR.on
+		if hb then hb:Disconnect(); hb = nil end
+		if charConn then charConn:Disconnect(); charConn = nil end
+		PR.used = {}
+		PR.cacheAt = 0
+		if PR.on then
+			hb = RunService.Heartbeat:Connect(step)
+			charConn = LP.CharacterAdded:Connect(function()
+				task.wait(0.5)
+				PR.used = {}
+				PR.cacheAt = 0
+			end)
+		end
+	end
+end
+do
+	local s = State.Utilities
+	local card = addCard(8, "wrench", "Utilities", "Killer and Survivor tools", "Utilities")
+	local function util(role, label, icn, key)
+		addCheckbox(card, label, icn,
+			function() return s[key] end,
+			function(v)
+				s[key] = v
+				local handler = State.UtilityHandlers[key]
+				if handler then pcall(handler, s.Enabled and v) end
+			end, nil, nil, role)
+	end
+	util(nil, "No Slow Down (Anti Fall)", "gauge", "NoSlowDown")
+	util("Killer", "Anti Blind Flashlight", "flashlight-off", "AntiBlindFlashlightK")
+	util("Killer", "Dash Lock", "lock", "DashLockK")
+	util("Killer", "Aimlock Attack", "crosshair", "AimlockAttackK")
+	util("Survivor", "Pallet Reflex", "layers", "PalletReflexS")
+	util("Survivor", "Always Fast Vault", "zap", "AlwaysFastVaultS")
+	util("Survivor", "Unlimited Vault", "infinity", "UnlimitedVaultS")
+	addSlider(card, "Dash Lock Radius", "ruler", 20, 150,
+		function() return math.clamp(math.floor(tonumber(s.DashRadius) or 50), 20, 150) end,
+		function(v) s.DashRadius = v end)
+	addSlider(card, "Pallet Reflex Distance", "ruler", 5, 80,
+		function() return math.clamp(math.floor(tonumber(State.PalletDist) or 20), 5, 80) end,
+		function(v) State.PalletDist = v end)
+end
+
+do
+	local s = State.TOF
+	local card = addCard(9, "crosshair", "Aimlock Twist of Fate", "Hold M2 / gun button to lock camera", "TOF")
+	addDropdown(card, "Target Mode", "user", { "Killer", "Survivor" },
+		function(v) return v end,
+		function() return s.TargetMode or "Killer" end,
+		function(v) s.TargetMode = v end)
+	addSlider(card, "FOV Radius", "ruler", 50, 1000,
+		function() return math.clamp(math.floor(tonumber(s.FOV) or 250), 50, 1000) end,
+		function(v) s.FOV = v end)
+	addSlider(card, "Aim Smoothness %", "gauge", 5, 100,
+		function() return math.clamp(math.floor(tonumber(s.Smooth) or 50), 5, 100) end,
+		function(v) s.Smooth = v end)
+	addSlider(card, "Prediction Strength %", "move", 0, 100,
+		function() return math.clamp(math.floor(tonumber(s.Predict) or 12), 0, 100) end,
+		function(v) s.Predict = v end)
+	addCheckbox(card, "Visibility Check", "eye",
+		function() return s.Vis end,
+		function(v) s.Vis = v end)
+	addCheckbox(card, "Show Laser", "scan-line",
+		function() return s.ShowLaser end,
+		function(v) s.ShowLaser = v end)
+end
+
+do
+	local s = State.AimFlash
+	local card = addCard(10, "flashlight", "Aimlock Flashlight", "Survivor flashlight aimlock", "AimFlash")
+	addDropdown(card, "Target Body", "user", { "Head", "UpperTorso", "Torso", "HumanoidRootPart" },
+		function(v) return v end,
+		function() return s.AimPart or "Head" end,
+		function(v) s.AimPart = v end)
+	addSlider(card, "Max Range", "ruler", 20, 250,
+		function() return math.clamp(math.floor(tonumber(s.Range) or 120), 20, 250) end,
+		function(v) s.Range = v end)
+	addSlider(card, "Smoothness %", "gauge", 5, 100,
+		function() return math.clamp(math.floor(tonumber(s.Smooth) or 35), 5, 100) end,
+		function(v) s.Smooth = v end)
+	addCheckbox(card, "Show Laser", "scan-line",
+		function() return s.ShowLaser end,
+		function(v) s.ShowLaser = v end)
+end
+
+do
+	local AV = { Enabled = false }
+	State.AvatarVisual = AV
+	local selectedId = LP.UserId
+	local selectedServer, presetName = nil, "Self Avatar"
+	local source = "preset"
+	local lastId = nil
+	local korless = { on = false, conn = nil }
+	local usernameInput = ""
+	local busy = false
+	local card
+
+	local function say(t) pcall(function() card.sub.Text = t end) end
+
+	local function applyKorlessOnce()
+		local ch = LP.Character
+		if not ch then return end
+		local leg = ch:FindFirstChild("Right Leg") or ch:FindFirstChild("RightUpperLeg")
+		local head = ch:FindFirstChild("Head")
+		if not leg or not head or ch:FindFirstChild("KorlessHead") then return end
+		head.Transparency = 1
+		local face = head:FindFirstChild("face")
+		if face then face:Destroy() end
+		leg.Transparency = 1
+		local mp = Instance.new("MeshPart")
+		mp.Name = "KorlessHead"
+		mp.Size = Vector3.new(0.85, 0.85, 0.85)
+		mp.CanCollide = false
+		mp.MeshId = "rbxassetid://902942096"
+		mp.TextureID = "rbxassetid://902843398"
+		mp.CFrame = leg.CFrame * CFrame.new(0, 0.7, 0)
+		mp.Parent = ch
+		local w = Instance.new("WeldConstraint")
+		w.Part0 = leg
+		w.Part1 = mp
+		w.Parent = mp
+	end
+
+	local function removeKorless()
+		local ch = LP.Character
+		if not ch then return end
+		local kh = ch:FindFirstChild("KorlessHead")
+		if kh then kh:Destroy() end
+		local head = ch:FindFirstChild("Head")
+		if head then head.Transparency = 0 end
+		local leg = ch:FindFirstChild("Right Leg") or ch:FindFirstChild("RightUpperLeg")
+		if leg then leg.Transparency = 0 end
+	end
+
+	local function setKorless(v)
+		korless.on = v and true or false
+		if korless.conn then korless.conn:Disconnect(); korless.conn = nil end
+		if korless.on then
+			task.spawn(applyKorlessOnce)
+			korless.conn = LP.CharacterAdded:Connect(function()
+				task.wait(1)
+				if korless.on and not unloaded then applyKorlessOnce() end
+			end)
+		else
+			removeKorless()
+		end
+	end
+
+	local function loadAppearance(appearance, character, head)
+		local items = appearance:GetChildren()
+		local function applyMesh(obj)
+			if obj:IsA("CharacterMesh") or obj:IsA("BodyColors") or obj:IsA("Shirt") or obj:IsA("Pants") then
+				local existing = character:FindFirstChild(obj.Name)
+				if existing and existing.ClassName == obj.ClassName then existing:Destroy() end
+				obj:Clone().Parent = character
+			end
+		end
+		for _, item in pairs(items) do
+			if item:IsA("Folder") or item:IsA("Model") then
+				for _, sub in pairs(item:GetChildren()) do applyMesh(sub) end
+			else
+				applyMesh(item)
+			end
+		end
+		for _, item in pairs(items) do
+			if item:IsA("SpecialMesh") and head then
+				local tm = head:FindFirstChildOfClass("SpecialMesh") or Instance.new("SpecialMesh", head)
+				tm.MeshType = Enum.MeshType.FileMesh
+				tm.MeshId = item.MeshId
+				tm.TextureId = item.TextureId
+			elseif item:IsA("Decal") and item.Name == "face" and head then
+				if head:FindFirstChild("face") then head.face:Destroy() end
+				item:Clone().Parent = head
+			end
+		end
+		for _, item in pairs(items) do
+			if item:IsA("Accessory") then
+				local clone = item:Clone()
+				local handle = clone:FindFirstChild("Handle")
+				if handle then
+					local att = handle:FindFirstChildOfClass("Attachment")
+					if att then
+						local ta = character:FindFirstChild(att.Name, true)
+						if ta then
+							local weld = Instance.new("Weld")
+							weld.Part0 = handle
+							weld.Part1 = ta.Parent
+							weld.C0 = att.CFrame
+							weld.C1 = ta.CFrame
+							weld.Parent = handle
+						end
+					end
+					handle.CanCollide = false
+					handle.Massless = true
+					clone.Parent = character
+				end
+			end
+		end
+	end
+
+	local function legacyApply(id, character, humanoid)
+		local ok, appearance = pcall(function() return Players:GetCharacterAppearanceAsync(id) end)
+		if not ok or not appearance then return false end
+		for _, obj in pairs(character:GetChildren()) do
+			if obj:IsA("Accessory") or obj:IsA("Shirt") or obj:IsA("Pants")
+				or obj:IsA("BodyColors") or obj:IsA("CharacterMesh") or obj:IsA("ShirtGraphic") then
+				obj:Destroy()
+			end
+		end
+		local head = character:FindFirstChild("Head")
+		if head then
+			for _, h in pairs(head:GetChildren()) do
+				if h:IsA("SpecialMesh") or h:IsA("Decal") then h:Destroy() end
+			end
+			local m = Instance.new("SpecialMesh", head)
+			m.MeshType = Enum.MeshType.Head
+			m.Scale = Vector3.new(1, 1, 1)
+		end
+		local defaults = {
+			BodyDepthScale = 1, BodyHeightScale = 1, BodyWidthScale = 1,
+			HeadScale = 1, BodyTypeScale = 0, BodyProportionScale = 0,
+		}
+		for name, val in pairs(defaults) do
+			local sv = humanoid:FindFirstChild(name)
+			if sv then sv.Value = val end
+		end
+		task.wait(0.1)
+		loadAppearance(appearance, character, head)
+		pcall(function()
+			local info = Players:GetCharacterAppearanceInfoAsync(id)
+			if head and info.assets then
+				for _, asset in pairs(info.assets) do
+					if asset.assetType.name == "Face" then
+						if head:FindFirstChild("face") then head.face:Destroy() end
+						local f = Instance.new("Decal", head)
+						f.Name = "face"
+						f.Texture = "rbxassetid://" .. asset.id
+						break
+					end
+				end
+			end
+		end)
+		return true
+	end
+
+	local function descApply(id, humanoid)
+		local ok, desc = pcall(function() return Players:GetHumanoidDescriptionFromUserId(id) end)
+		if not ok or not desc then return false end
+		local applied = pcall(function() humanoid:ApplyDescriptionReset(desc) end)
+		if not applied then applied = pcall(function() humanoid:ApplyDescription(desc) end) end
+		if not applied then return false end
+		task.wait(0.4)
+		local okA, cur = pcall(function() return humanoid:GetAppliedDescription() end)
+		if not okA or not cur then return false end
+		return cur.Shirt == desc.Shirt and cur.Pants == desc.Pants and cur.Face == desc.Face
+	end
+
+	local function applyAvatar(id)
+		local character = LP.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not humanoid then
+			say("No character")
+			return
+		end
+		lastId = id
+		local done = descApply(id, humanoid)
+		if not done then done = legacyApply(id, character, humanoid) end
+		if korless.on then
+			task.wait(0.1)
+			applyKorlessOnce()
+		end
+		say(done and "Applied" or "Failed")
+	end
+
+	local function resolveId()
+		if source == "user" then
+			if usernameInput == "" then return nil, "Enter a username or ID" end
+			local n = tonumber(usernameInput)
+			if n then return n end
+			local ok, id = pcall(function() return Players:GetUserIdFromNameAsync(usernameInput) end)
+			if not ok or not id then return nil, "User not found" end
+			return id
+		end
+		return selectedId
+	end
+
+	card = addCard(11, "user", "Avatar Visual", "ON keeps avatar after respawn", "AvatarVisual", function(on)
+		AV.Enabled = on == true
+		if AV.Enabled and lastId then task.spawn(applyAvatar, lastId) end
+	end)
+
+	local serverList = {}
+	local function refreshServerList()
+		for i = #serverList, 1, -1 do serverList[i] = nil end
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP then serverList[#serverList + 1] = p.Name end
+		end
+		table.sort(serverList)
+		if #serverList == 0 then serverList[1] = "No players" end
+	end
+	refreshServerList()
+	Players.PlayerAdded:Connect(function() task.delay(1, refreshServerList) end)
+	Players.PlayerRemoving:Connect(function() task.delay(1, refreshServerList) end)
+
+	addDropdown(card, "Server Players", "users", serverList,
+		function(v) return v or "Select" end,
+		function() return selectedServer end,
+		function(v)
+			selectedServer = v
+			local plr = Players:FindFirstChild(v)
+			if plr and plr.UserId then
+				selectedId = plr.UserId
+				source = "server"
+			end
+		end)
+
+	local PRESET_IDS = {
+		["Self Avatar"] = LP.UserId,
+		["Random 1"] = 2888298851, ["Random 2"] = 10074747755,
+		["Random 3"] = 5209567453, ["Random 4"] = 8991982843,
+		["Random 5"] = 5796319029, ["Random 6"] = 9744452117,
+		["Random 7"] = 8476755006,
+		["WoozyNate"] = 146089324, ["Nicholas"] = 909635,
+		["yvlyf"] = 181751703, ["traevp"] = 471607078,
+		["J0LLY"] = 1073847038, ["LucashDev"] = 2525651744,
+		["CEOofIsaac"] = 63238912, ["Stealthy"] = 56602747,
+		["Wildes"] = 40397833, ["Talon"] = 75974130,
+		["Relukt"] = 65042011, ["Sammy"] = 2678001507,
+		["Diesel"] = 9123921576, ["S4ans03"] = 35439794,
+		["Aura"] = 2275806428, ["iJava"] = 276557820,
+		["White Guy"] = 8843268357, ["Purple King"] = 9070758608,
+		["Kachaaaa Gay"] = 8956318334, ["Mpruyyy"] = 8340163775,
+	}
+	local PRESET_ORDER = {
+		"Self Avatar", "Random 1", "Random 2", "Random 3", "Random 4", "Random 5", "Random 6", "Random 7",
+		"WoozyNate", "Nicholas", "yvlyf", "traevp", "J0LLY", "LucashDev", "CEOofIsaac", "Stealthy",
+		"Wildes", "Talon", "Relukt", "Sammy", "Diesel", "S4ans03", "Aura", "iJava", "White Guy",
+		"Purple King", "Kachaaaa Gay", "Mpruyyy",
+	}
+	addDropdown(card, "Preset Avatars", "layers", PRESET_ORDER,
+		function(v) return v end,
+		function() return presetName end,
+		function(v)
+			presetName = v
+			selectedId = PRESET_IDS[v] or LP.UserId
+			source = "preset"
+		end)
+
+	local ctrl = addOption(card, "Username / ID", "user")
+	local box = new("TextBox", {
+		Size = UDim2.fromOffset(130, 26),
+		BackgroundColor3 = C.Surface,
+		Text = "",
+		PlaceholderText = "username or user id",
+		PlaceholderColor3 = C.Muted,
+		TextColor3 = C.Text,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		ClearTextOnFocus = false,
+		LayoutOrder = 1,
+	}, ctrl)
+	corner(box, 6)
+	box:GetPropertyChangedSignal("Text"):Connect(function()
+		usernameInput = (box.Text or ""):gsub("^@", ""):gsub("%s+", "")
+		if usernameInput ~= "" then source = "user" end
+	end)
+
+	local _, applyBtn = addOption(card, "Apply Avatar", "check", true)
+	applyBtn.MouseButton1Click:Connect(function()
+		if busy then return end
+		busy = true
+		task.spawn(function()
+			say("Loading")
+			local id, err = resolveId()
+			if id then applyAvatar(id) else say(err or "Failed") end
+			busy = false
+		end)
+	end)
+
+	local _, resetBtn = addOption(card, "Reset to Own Avatar", "rotate-ccw", true)
+	resetBtn.MouseButton1Click:Connect(function()
+		if busy then return end
+		busy = true
+		task.spawn(function()
+			say("Loading")
+			applyAvatar(LP.UserId)
+			busy = false
+		end)
+	end)
+
+	addCheckbox(card, "Korless Morph", "skull",
+		function() return korless.on end,
+		function(v) setKorless(v) end)
+
+	LP.CharacterAdded:Connect(function()
+		task.wait(1.5)
+		if unloaded then return end
+		if AV.Enabled and lastId then applyAvatar(lastId) end
+		if korless.on then applyKorlessOnce() end
+	end)
+end
+
 do
 	local s = State.AutoPumpkin
 	local farm = State.PumpkinFarmObj
@@ -4870,6 +6219,32 @@ do
 	opt("Low: Hide Sky", "cloud",      "LowGFX_Sky")
 	opt("Remove Trees",  "tree-pine",  "RemoveTree")
 	opt("Remove Grass",  "sprout",     "RemoveGrass")
+	local _, inspectBtn = addOption(card, "Inspect Aimed Object", "crosshair", true)
+	inspectBtn.MouseButton1Click:Connect(function()
+		local cam = workspace.CurrentCamera
+		if not cam then return end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { LP.Character }
+		local res = workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 1000, params)
+		local inst = res and res.Instance
+		if not inst then
+			card.sub.Text = "Nothing at screen center"
+			return
+		end
+		local chain, cur = {}, inst
+		for _ = 1, 6 do
+			if not cur or cur == workspace then break end
+			table.insert(chain, cur.Name .. " (" .. cur.ClassName .. ")")
+			cur = cur.Parent
+		end
+		local info = string.format("%s | Material=%s | Size=%.1f,%.1f,%.1f | Collide=%s | %s",
+			inst.Name, tostring(inst.Material), inst.Size.X, inst.Size.Y, inst.Size.Z,
+			tostring(inst.CanCollide), table.concat(chain, " < "))
+		if setclipboard then pcall(setclipboard, info) end
+		warn("[" .. HUB_NAME .. "] " .. info)
+		card.sub.Text = inst.Name
+	end)
 end
 
 do
@@ -5033,6 +6408,12 @@ local function unload()
 	pcall(function() State.PumpkinFarmObj:Shutdown() end)
 	pcall(function() State.PerfObj:Stop() end)
 	pcall(function() State.CameraObj:Destroy() end)
+	pcall(function() State.TOFObj:Destroy() end)
+	pcall(function() State.FlashObj:Destroy() end)
+	pcall(function() State.NoSlow.K = false; State.NoSlow.S = false end)
+	pcall(function()
+		for _, handler in pairs(State.UtilityHandlers) do handler(false) end
+	end)
 	pcall(function() State.SkillCheckObj:Stop() end)
 	pcall(function() State.SpearObj.Destroy() end)
 
@@ -5114,10 +6495,10 @@ local function showCloseConfirm()
 		b.MouseButton1Click:Connect(cb)
 		return b
 	end
-	dialogButton("Continue", 0, C.Surface, C.Text, function()
+	dialogButton("Back", 0, C.Surface, C.Text, function()
 		if closeConfirm then closeConfirm:Destroy(); closeConfirm = nil end
 	end)
-	dialogButton("Close", 0.5, C.Accent, C.OnAccent, function()
+	dialogButton("Continue", 0.5, C.Accent, C.OnAccent, function()
 		if closeConfirm then closeConfirm:Destroy(); closeConfirm = nil end
 		unload()
 	end)
