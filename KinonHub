@@ -7228,22 +7228,152 @@ local function KinonBuildUI(buildFeatures)
 	end
 	track(List:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateMainHeight))
 
+	-- ============================================================
+	-- Minimized state: a small floating bubble instead of a bare header bar.
+	-- Tap it to bring the hub back; drag it anywhere on screen first.
+	-- ============================================================
+	local Bubble = new("TextButton", {
+		Name = "Bubble",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(52, 52),
+		BackgroundColor3 = C.Panel,
+		BackgroundTransparency = 0.04,
+		Text = "",
+		AutoButtonColor = false,
+		Visible = false,
+		ZIndex = 50,
+	}, Gui)
+	corner(Bubble, 26)
+	local bubbleStroke = new("UIStroke", { Color = WHITE, Transparency = 0.5, Thickness = 1.5 }, Bubble)
+	new("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = string.sub(HUB_NAME, 1, 1),
+		TextColor3 = C.Text,
+		Font = Enum.Font.GothamBlack,
+		TextSize = 20,
+		ZIndex = 51,
+	}, Bubble)
+
+	local function clampToScreen(pos)
+		local cam = workspace.CurrentCamera
+		if not cam then return pos end
+		local vp = cam.ViewportSize
+		local size = Bubble.AbsoluteSize
+		local x = math.clamp(pos.X.Offset, size.X / 2, math.max(size.X / 2, vp.X - size.X / 2))
+		local y = math.clamp(pos.Y.Offset, size.Y / 2, math.max(size.Y / 2, vp.Y - size.Y / 2))
+		return UDim2.fromOffset(x, y)
+	end
+
+	do
+		local bDragInput, bDragStart, bStartPos, bMoved = nil, nil, nil, false
+		Bubble.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+				bDragInput, bDragStart, bStartPos, bMoved = i, Vector2.new(i.Position.X, i.Position.Y), Bubble.Position, false
+			end
+		end)
+		track(UserInputService.InputChanged:Connect(function(i)
+			if not bDragInput then return end
+			if i.UserInputType == Enum.UserInputType.MouseMovement or i == bDragInput then
+				local d = Vector2.new(i.Position.X, i.Position.Y) - bDragStart
+				if d.Magnitude > 4 then bMoved = true end
+				Bubble.Position = clampToScreen(UDim2.new(
+					bStartPos.X.Scale, bStartPos.X.Offset + d.X,
+					bStartPos.Y.Scale, bStartPos.Y.Offset + d.Y
+				))
+			end
+		end))
+		track(UserInputService.InputEnded:Connect(function(i)
+			if i ~= bDragInput then return end
+			bDragInput = nil
+			if not bMoved then
+				minimized = false
+				Bubble.Visible = false
+				Main.Visible = true
+				Body.Visible = true
+				updateMainHeight()
+			end
+		end))
+	end
+
 	minBtn.MouseButton1Click:Connect(function()
-		minimized = not minimized
-		Body.Visible = not minimized
-		if minimized then
-			Main.Size = UDim2.fromOffset(WIDTH, HEADER_H)
-		else
-			updateMainHeight()
-		end
+		minimized = true
+		Main.Visible = false
+		Bubble.Visible = true
 	end)
 
+	-- ============================================================
+	-- Close confirmation overlay
+	-- ============================================================
 	local function destroyUI()
 		pcall(function() Gui:Destroy() end)
 	end
-	closeBtn.MouseButton1Click:Connect(function()
+
+	local Confirm = new("Frame", {
+		Name = "ConfirmClose",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+		BackgroundTransparency = 0.35,
+		Visible = false,
+		ZIndex = 40,
+	}, Main)
+	local confirmBox = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -48, 0, 110),
+		BackgroundColor3 = C.Panel,
+		BackgroundTransparency = 0.02,
+		ZIndex = 41,
+	}, Confirm)
+	corner(confirmBox, 12)
+	new("UIStroke", { Color = WHITE, Transparency = 0.6, Thickness = 1 }, confirmBox)
+	new("TextLabel", {
+		Position = UDim2.new(0, 12, 0, 10),
+		Size = UDim2.new(1, -24, 0, 42),
+		BackgroundTransparency = 1,
+		Text = "Yakin ingin menutup UI ini?",
+		TextWrapped = true,
+		TextColor3 = C.Text,
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		ZIndex = 42,
+	}, confirmBox)
+	local confirmYes = new("TextButton", {
+		Position = UDim2.new(0, 12, 1, -42),
+		Size = UDim2.new(0.5, -18, 0, 32),
+		BackgroundColor3 = Color3.fromRGB(210, 60, 60),
+		Text = "Ya, Tutup",
+		TextColor3 = WHITE,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		AutoButtonColor = true,
+		ZIndex = 42,
+	}, confirmBox)
+	corner(confirmYes, 8)
+	local confirmNo = new("TextButton", {
+		Position = UDim2.new(0.5, 6, 1, -42),
+		Size = UDim2.new(0.5, -18, 0, 32),
+		BackgroundColor3 = C.Card,
+		Text = "Batal",
+		TextColor3 = C.Text,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		AutoButtonColor = true,
+		ZIndex = 42,
+	}, confirmBox)
+	corner(confirmNo, 8)
+
+	confirmYes.MouseButton1Click:Connect(function()
 		if type(_G.KinonHubBetaUnload) == "function" then pcall(_G.KinonHubBetaUnload) end
 		destroyUI()
+	end)
+	confirmNo.MouseButton1Click:Connect(function()
+		Confirm.Visible = false
+	end)
+
+	closeBtn.MouseButton1Click:Connect(function()
+		Confirm.Visible = true
 	end)
 
 	local dragInput, dragStart, startPos
