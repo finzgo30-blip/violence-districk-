@@ -1722,15 +1722,29 @@ local State, Hooks = {}, {}
 local Parry = {
     Enabled = false,
     Range = 14,
-    ReachBonus = 0,
-    SafetyParry = true,
+    SafetyParry = false,
     AggressiveMode = true,
     FaceSensitivity = 6,
     FaceMemo = setmetatable({}, { __mode = "k" }),
     CircleVisible = false,
     RangeColor = Color3.fromRGB(255, 255, 255),
 }
-local VD_SkipParryOptions = {}
+local VD_SkipParryOptions = {
+	["106871536134254"] = false,
+	["117070354890871"] = false,
+	["73681849513551"] = false,
+	["100014992013740"] = false,
+}
+local VD_SkipParryNameToId = {
+	["Masked Alex Attack"] = "106871536134254",
+	["Masked Alex Lunge"]  = "117070354890871",
+	["Hidden Dash"]        = "73681849513551",
+	["Abyswalker Slash"]   = "100014992013740",
+}
+local KINON_LungeAnimationIds = {
+	[VD_SkipParryNameToId["Masked Alex Lunge"]] = true,
+	[VD_SkipParryNameToId["Hidden Dash"]] = true,
+}
 
 -- Remove tagged visuals from an earlier execution so the new UI starts clean.
 do
@@ -2769,8 +2783,6 @@ end
 
 
 
--- ===== AUTO SKILL CHECK (original lines 2387-2618) =====
-
 State.SkillCheckObj = (function()
 	local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 	local GuiService          = game:GetService("GuiService")
@@ -2786,6 +2798,72 @@ State.SkillCheckObj = (function()
 		LegitMinOffset = 102, LegitMaxOffset = 116,
 		NormalMinOffset = 116, NormalMaxOffset = 140,
 	}
+
+	local ActiveLine, ActiveTargetRot = nil, nil
+	local rotationHookInstalled = false
+	local function installRotationHook()
+		if rotationHookInstalled then return end
+		pcall(function()
+			if hookmetamethod then
+				local origIndex
+				origIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+					if key == "Rotation" and not (checkcaller and checkcaller()) then
+						if ActiveLine and self == ActiveLine and ActiveTargetRot then
+							return ActiveTargetRot
+						end
+						local spoofLine = State.TrapSpoofLine
+						if spoofLine and self == spoofLine and State.TrapSpoofRot then
+							return State.TrapSpoofRot
+						end
+					end
+					return origIndex(self, key)
+				end))
+				rotationHookInstalled = true
+			end
+		end)
+	end
+	State.InstallRotationHook = installRotationHook
+
+	local function getPingSeconds()
+		local ping = 0.06
+		pcall(function()
+			local p = LP:GetNetworkPing()
+			if type(p) == "number" and p > 0 then ping = p end
+		end)
+		return ping
+	end
+
+	local genCache, genCacheAt = {}, 0
+	local function nearestGeneratorProgress()
+		local char = LP.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root then return nil end
+		if os.clock() - genCacheAt > 4 then
+			genCacheAt = os.clock()
+			genCache = {}
+			pcall(function()
+				for _, d in ipairs(workspace:GetDescendants()) do
+					if d:IsA("Model") and string.lower(d.Name) == "generator" and d:GetAttribute("RepairProgress") ~= nil then
+						genCache[#genCache + 1] = d
+					end
+				end
+			end)
+		end
+		local best, bestDist
+		for _, g in ipairs(genCache) do
+			if g.Parent then
+				local ok, pivot = pcall(function() return g:GetPivot().Position end)
+				if ok and pivot then
+					local dist = (pivot - root.Position).Magnitude
+					if dist <= 25 and (not bestDist or dist < bestDist) then
+						best, bestDist = g, dist
+					end
+				end
+			end
+		end
+		if not best then return nil end
+		return tonumber(best:GetAttribute("RepairProgress"))
+	end
 
 	local Class = {}
 	Class.__index = Class
@@ -2806,10 +2884,12 @@ State.SkillCheckObj = (function()
 		if not mob then return nil end
 		local controls = mob:FindFirstChild("Controls")
 		if not controls then return nil end
-		return controls:FindFirstChild("action") or controls:FindFirstChild("check")
+		local action = controls:FindFirstChild("action")
+		if action and action:IsA("GuiObject") then return action end
+		return controls:FindFirstChild("check", true)
 	end
 
-	function Class:_fireAction()
+	function Class:_fireActionV91()
 		local btn = self:_getActionButton()
 
 		if btn and btn:IsA("GuiObject") and btn.Visible and type(firesignal) == "function" then
@@ -2823,11 +2903,8 @@ State.SkillCheckObj = (function()
 
 		if btn and btn:IsA("GuiObject") and btn.Visible then
 			local ok = pcall(function()
-				local ap, as = btn.AbsolutePosition, btn.AbsoluteSize
-				local inset = GuiService:GetGuiInset()
+				local x, y = self:_buttonCenter(btn)
 				local id = 8822 + math.random(1, 9999)
-				local x = ap.X + as.X / 2 + inset.X
-				local y = ap.Y + as.Y / 2 + inset.Y
 				VirtualInputManager:SendTouchEvent(id, 0, x, y)
 				task.wait(0.005)
 				VirtualInputManager:SendTouchEvent(id, 2, x, y)
@@ -2835,12 +2912,75 @@ State.SkillCheckObj = (function()
 			if ok then return true end
 		end
 
-		local keyOk = pcall(function()
+		pcall(function()
 			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-			 task.wait(0.005)
+			task.wait(0.005)
 			VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
 		end)
-		return keyOk
+		return true
+	end
+
+	function Class:_buttonCenter(btn)
+		local p, z = btn.AbsolutePosition, btn.AbsoluteSize
+		local ix, iy = 0, 0
+		local sg = btn:FindFirstAncestorWhichIsA("ScreenGui")
+		if not (sg and sg.IgnoreGuiInset) then
+			local inset = GuiService:GetGuiInset()
+			ix, iy = inset.X, inset.Y
+		end
+		return p.X + z.X * 0.5 + ix, p.Y + z.Y * 0.5 + iy
+	end
+
+	function Class:_fireAction(hold)
+		hold = hold or 0.025
+		local btn = self:_getActionButton()
+		local method = self._method or 1
+		local usable = btn and btn:IsA("GuiObject") and btn.Visible
+			and btn.AbsoluteSize.X > 0 and btn.AbsoluteSize.Y > 0
+		local done = false
+
+		if method == 1 and UserInputService.TouchEnabled and usable then
+			local x, y = self:_buttonCenter(btn)
+			local began = pcall(function() VirtualInputManager:SendTouchEvent(8822, 0, x, y) end)
+			task.wait(hold)
+			pcall(function() VirtualInputManager:SendTouchEvent(8822, 2, x, y) end)
+			done = began
+		elseif method == 2 and usable and type(firesignal) == "function" then
+			done = pcall(function()
+				firesignal(btn.MouseButton1Down)
+				if btn:IsA("GuiButton") then firesignal(btn.Activated, Enum.UserInputType.Touch, 0) end
+				task.wait(hold)
+				firesignal(btn.MouseButton1Up)
+				if btn:IsA("GuiButton") then firesignal(btn.MouseButton1Click) end
+			end)
+		end
+
+		if not done then
+			done = pcall(function()
+				VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+				task.wait(hold)
+				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+			end)
+		end
+
+		task.delay(0.4, function()
+			local stillThere = false
+			for _, guiName in ipairs({ "SkillCheckPromptGui", "SkillCheckPromptGui-con" }) do
+				local g = PlayerGui:FindFirstChild(guiName)
+				local c = g and g.Enabled ~= false and g:FindFirstChild("Check")
+				if c and c.Visible then stillThere = true end
+			end
+			if stillThere then
+				self._fail = (self._fail or 0) + 1
+				if self._fail >= 2 then
+					self._fail = 0
+					self._method = (method % 3) + 1
+				end
+			else
+				self._fail = 0
+			end
+		end)
+		return done
 	end
 
 	function Class:_inAngleRange(lineRot, goalRot, minOff, maxOff)
@@ -2852,51 +2992,10 @@ State.SkillCheckObj = (function()
 		return minA <= lineRot and lineRot <= maxA
 	end
 
-	function Class:_safetyProgress()
-		local now = os.clock()
-		if now - (self._genScanAt or 0) > 6 then
-			self._genScanAt = now
-			local list = {}
-			local map = workspace:FindFirstChild("Map")
-			if map then
-				for _, d in ipairs(map:GetDescendants()) do
-					if d:IsA("Model") and string.lower(d.Name) == "generator" then
-						table.insert(list, d)
-					end
-				end
-			end
-			self._gens = list
-		end
-		local char = LP.Character
-		local root = char and char:FindFirstChild("HumanoidRootPart")
-		if not root then return 0 end
-		local best, bestDist = 0, 45
-		for _, g in ipairs(self._gens or {}) do
-			if g.Parent then
-				local part = g.PrimaryPart or g:FindFirstChildWhichIsA("BasePart")
-				if part then
-					local d = (part.Position - root.Position).Magnitude
-					if d < bestDist then
-						bestDist = d
-						best = tonumber(g:GetAttribute("RepairProgress")) or 0
-					end
-				end
-			end
-		end
-		return best
-	end
-
-	function Class:_shouldSnapInstant()
-		local m = self.Settings.Mode
-		if m == "Instant" then return true end
-		if m == "Safety" then return self:_safetyProgress() < 90 end
-		return false
-	end
-
 	function Class:_shouldFireByRange(lineRot, goalRot)
 		local S = self.Settings
-		local m = S.Mode
-		if m == "Normal" or m == "Safety" then
+		local m = self._effMode or S.Mode
+		if m == "Normal" then
 			return self:_inAngleRange(lineRot, goalRot, S.NormalMinOffset, S.NormalMaxOffset)
 		end
 		return self:_inAngleRange(lineRot, goalRot, S.LegitMinOffset, S.LegitMaxOffset)
@@ -2905,37 +3004,95 @@ State.SkillCheckObj = (function()
 	function Class:_onHeartbeat()
 		if not self.Settings.Enabled or self._busy then return end
 
-		local scGui = PlayerGui:FindFirstChild("SkillCheckPromptGui")
+		local scGui
+		for _, guiName in ipairs({ "SkillCheckPromptGui", "SkillCheckPromptGui-con" }) do
+			local candidate = PlayerGui:FindFirstChild(guiName)
+			if candidate and candidate.Enabled ~= false then
+				local c = candidate:FindFirstChild("Check")
+				if c and c.Visible then scGui = candidate; break end
+			end
+		end
 		if not scGui then return end
 
 		local check = scGui:FindFirstChild("Check")
-		if not check or not check.Visible then
-			self._randomModeIsNormal = false
+		if not check or not check.Visible then return end
+		local line = check:FindFirstChild("Line")
+		if not line then return end
+
+		local mode = self.Settings.Mode
+		self._effMode = nil
+		if mode == "Instant" then
+			local prog = nearestGeneratorProgress()
+			if prog and prog >= 90 then
+				mode = "Normal"
+				self._effMode = "Normal"
+			end
+		end
+		local goal = check:FindFirstChild("Goal")
+		local trap = check:FindFirstChild("TrapPerfect") or check:FindFirstChild("TrapGoal")
+		local trapChar = LP.Character
+		if (trap and trap.Visible) or (trapChar and (trapChar:GetAttribute("Trapped") == true or trapChar:GetAttribute("EscapingTrap") == true)) then return end
+
+		if mode == "Instant" then
+
+			local trapPerfect = check:FindFirstChild("TrapPerfect")
+			local isTrapPerfect = trapPerfect and trapPerfect.Visible
+			local target = isTrapPerfect and trapPerfect or (trap and trap.Visible and trap) or (goal and goal.Visible and goal)
+			if not target then return end
+
+			if self._instantPromptAt == nil or self._instantPromptTarget ~= target then
+				self._instantPromptAt = os.clock()
+				self._instantPromptTarget = target
+			end
+
+			local minWait = math.clamp(0.12 + getPingSeconds() * 0.6, 0.14, 0.28)
+			if os.clock() - self._instantPromptAt < minWait then return end
+
+			self._busy = true
+			local targetRot = isTrapPerfect and (target.Rotation % 360) or ((target.Rotation + self.Settings.InstantOffset) % 360)
+			ActiveLine, ActiveTargetRot = line, targetRot
+			line.Rotation = targetRot
+			task.spawn(function()
+				local fired = false
+				local lockActive = true
+
+				local lockConn = RunService.RenderStepped:Connect(function()
+					if lockActive and line and line.Parent then
+						line.Rotation = targetRot
+					end
+				end)
+				local ok = pcall(function()
+					for _ = 1, 2 do
+						line.Rotation = targetRot
+						RunService.Heartbeat:Wait()
+					end
+					fired = self:_fireActionV91()
+				end)
+				task.wait(0.10)
+				lockActive = false
+				if lockConn then lockConn:Disconnect() end
+				task.wait(0.15)
+				if ActiveLine == line then ActiveLine, ActiveTargetRot = nil, nil end
+				self._instantPromptAt, self._instantPromptTarget = nil, nil
+				if fired and ok then
+					self.Stats.Hits = self.Stats.Hits + 1
+				else
+					self.Stats.Missed = self.Stats.Missed + 1
+				end
+				task.wait(math.max(0.12, self.Settings.BusyResetDelay))
+				self._busy = false
+			end)
 			return
 		end
 
-		local line = check:FindFirstChild("Line")
-		local goal = check:FindFirstChild("Goal")
-		if not line or not goal then return end
-		local trapA = check:FindFirstChild("TrapPerfect")
-		local trapB = check:FindFirstChild("TrapGoal")
-		if (trapA and trapA.Visible) or (trapB and trapB.Visible) then return end
-
-		local fireNow = false
-		if self:_shouldSnapInstant() then
-			pcall(function()
-				line.Rotation = goal.Rotation + self.Settings.InstantOffset
-			end)
-			fireNow = true
-		else
-			fireNow = self:_shouldFireByRange(line.Rotation % 360, goal.Rotation % 360)
-		end
-
-		if not fireNow then return end
+		if not goal then return end
+		if (check:FindFirstChild("TrapPerfect") and check.TrapPerfect.Visible)
+			or (check:FindFirstChild("TrapGoal") and check.TrapGoal.Visible) then return end
+		if not self:_shouldFireByRange(line.Rotation % 360, goal.Rotation % 360) then return end
 
 		self._busy = true
 		task.spawn(function()
-			local ok = pcall(function() self:_fireAction() end)
+			local ok = self:_fireActionV91()
 			if ok then
 				self.Stats.Hits = self.Stats.Hits + 1
 			else
@@ -2966,6 +3123,7 @@ State.SkillCheckObj = (function()
 
 	function Class:Start()
 		self.Settings.Enabled = true
+		if self.Settings.Mode == "Instant" then installRotationHook() end
 		if self._heartbeat then return end
 		self:_hookKingScourge()
 		self._heartbeat = RunService.Heartbeat:Connect(function()
@@ -2989,9 +3147,10 @@ State.SkillCheckObj = (function()
 	end
 
 	function Class:SetMode(mode)
-		local valid = { Legit = true, Instant = true, Normal = true, Safety = true }
+		local valid = { Legit = true, Normal = true, Instant = true }
 		if not valid[mode] then return false end
 		self.Settings.Mode = mode
+		if mode == "Instant" then installRotationHook() end
 		self._randomModeIsNormal = false
 		return true
 	end
@@ -3003,6 +3162,1017 @@ State.SkillCheck = State.SkillCheckObj.Settings
 Hooks.SkillCheck = function(s)
 	if s.Enabled then State.SkillCheckObj:Start() else State.SkillCheckObj:Stop() end
 end
+
+-- ===== SILENT TWIST OF FATE (ported from Kinon) =====
+do
+local function getTOFGunPart(ch)
+	local tool = ch and ch:FindFirstChild("Twist of Fate", true)
+	if not tool then return nil end
+
+	local rightArm = tool:FindFirstChild("Right Arm", true)
+	if rightArm then
+		for _, name in ipairs({ "gun", "EmperorGun" }) do
+			local gun = rightArm:FindFirstChild(name)
+			if gun then
+				if gun:IsA("BasePart") then return gun end
+				local part = gun:FindFirstChildWhichIsA("BasePart", true)
+				if part then return part end
+			end
+		end
+	end
+
+	if tool:IsA("BasePart") then return tool end
+	return tool:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getTOFLaserOrigin(ch)
+	local gunPart = getTOFGunPart(ch)
+	return gunPart and gunPart.Position or nil
+end
+
+State.Motion = {}
+do
+	local M = State.Motion
+	local exp = math.exp
+	function M.Regress(list, tn, window, tau)
+		if not list then return nil end
+		local sw, sdt, sdt2, n = 0, 0, 0, 0
+		local sp, sdtp = Vector3.zero, Vector3.zero
+		for i = #list, 1, -1 do
+			local e = list[i]
+			local dt = e.t - tn
+			if dt < -window then break end
+			local w = exp(dt / tau)
+			sw = sw + w
+			sdt = sdt + w * dt
+			sdt2 = sdt2 + w * dt * dt
+			sp = sp + e.p * w
+			sdtp = sdtp + e.p * (w * dt)
+			n = n + 1
+		end
+		if n < 3 then return nil end
+		local denom = sw * sdt2 - sdt * sdt
+		if denom < 1e-9 then return nil end
+		local slope = (sdtp * sw - sp * sdt) / denom
+		local c = (sp - slope * sdt) / sw
+		return slope, c, n
+	end
+	function M.Estimate(list)
+		if not list or #list < 4 then return nil end
+		local tn = list[#list].t
+		local vS = M.Regress(list, tn, 0.14, 0.07)
+		local vL = M.Regress(list, tn, 0.40, 0.2)
+		if not vS and not vL then return nil end
+		if not vS then return vL, Vector3.zero, false end
+		if not vL then return vS, Vector3.zero, false end
+		local fs, fl = Vector3.new(vS.X, 0, vS.Z), Vector3.new(vL.X, 0, vL.Z)
+		local reversal = fl.Magnitude > 2 and fs.Magnitude > 2 and fs:Dot(fl) < 0
+		local vel = reversal and vS or (vS * 0.7 + vL * 0.3)
+		local acc = (vS - vL) / 0.12
+		if acc.Magnitude > 50 then acc = acc.Unit * 50 end
+		return vel, acc, reversal
+	end
+end
+
+State.AimHold = { held = false, ok = false, tried = false }
+do
+	local AH = State.AimHold
+	local old
+	AH.Install = function()
+		if AH.tried then return end
+		AH.tried = true
+		if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then return end
+		local wrapf = newcclosure or function(f) return f end
+		local ok = pcall(function()
+			old = hookmetamethod(game, "__namecall", wrapf(function(self, ...)
+				local method = getnamecallmethod()
+				if setnamecallmethod then setnamecallmethod(method) end
+				if not unloaded and method == "FireServer" and typeof(self) == "Instance" and self.Name == "AimHold" and self.ClassName == "RemoteEvent" then
+					local v = select(2, ...)
+					if type(v) == "boolean" then AH.held = v end
+				end
+				if setnamecallmethod then setnamecallmethod(method) end
+				return old(self, ...)
+			end))
+		end)
+		AH.ok = ok and old ~= nil
+	end
+end
+
+State.TOFSilent = {
+	Enabled = false,
+	FOV = 120,
+	Predict = true,
+	LeadScale = 100,
+	ShowCircle = true,
+	ShowLaser = true,
+	SmartPredict = true,
+	UseSnap = true,
+	UseTravel = true,
+	WallCheck = true,
+	Windup = 0.05,
+	LineSmooth = 70,
+}
+
+State.SmartPredict = (function()
+    local T  = State.TOFSilent
+    local SP = {}
+
+    local VD = {
+        TOF_HitGainN    = 1,
+        TOF_HitGainM    = 1,
+        TOF_HitGainF    = 1,
+        TOF_TravelK     = 0.5,
+        TOF_BulletSpeed = 800,
+        TOF_DelayAuto   = nil,
+    }
+    SP.VD = VD
+
+    local Track   = setmetatable({}, { __mode = "k" })
+    local SnapBuf = {}
+    local Shot    = nil
+    local LastPred, LastReal = nil, nil
+    local RawMode = false
+    local LastVel, LastMult, LastBase, LastVB = nil, 1, 0, 800
+
+    function SP.Ping()
+        local p = 0.08
+        pcall(function() p = math.clamp(LP:GetNetworkPing(), 0, 0.35) end)
+        return p
+    end
+
+    function SP.Delay()
+        if tonumber(VD.TOF_DelayAuto) then
+            return math.clamp(VD.TOF_DelayAuto, 0.05, 1.5)
+        end
+        return (tonumber(T.Windup) or 0.05) + SP.Ping() * 0.8
+    end
+
+    local function Band(d) return d < 15 and "N" or (d < 35 and "M" or "F") end
+    SP.Band = Band
+
+    function SP.ArcDisp(vel, omega, Tm)
+        local N, dt = 6, Tm / 6
+        local rot = CFrame.Angles(0, omega * dt, 0)
+        local pos, dir = Vector3.zero, vel
+        for _ = 1, N do
+            pos = pos + dir * dt
+            dir = rot:VectorToWorldSpace(dir)
+        end
+        return pos
+    end
+
+    function SP.ConfEff(S)
+        if math.abs(S.omega or 0) > 0.35 then return math.max(S.conf, 0.6) end
+        return S.conf
+    end
+
+    local hooked = setmetatable({}, { __mode = "k" })
+    local function HookBullet(r)
+        if hooked[r] then return end
+        hooked[r] = true
+        r.OnClientEvent:Connect(function(origin, endp, spd)
+            local sh = Shot
+            if not sh or sh.used or typeof(origin) ~= "Vector3" or typeof(endp) ~= "Vector3" then return end
+            local dt = os.clock() - sh.t
+            if dt < 0.05 or dt > 1.6 then return end
+            local ch  = LP.Character
+            local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+            if not hrp or (origin - hrp.Position).Magnitude > 15 then return end
+            sh.used = true
+            if type(spd) == "number" and spd > 5 then VD.TOF_BulletSpeed = spd end
+            local cur = tonumber(VD.TOF_DelayAuto)
+            VD.TOF_DelayAuto = cur and (cur + (dt - cur) * 0.3) or dt
+            if sh.real and sh.aim and sh.tc and sh.vel then
+                task.delay(0.1, function()
+                    local root = sh.tc:FindFirstChild("HumanoidRootPart") or sh.tc:FindFirstChild("Torso")
+                    if not (root and root.Parent) then return end
+                    local real, aim = sh.real, sh.aim
+                    local L  = Vector3.new(aim.X - real.X, 0, aim.Z - real.Z)
+                    local D  = Vector3.new(root.Position.X - real.X, 0, root.Position.Z - real.Z)
+                    local vh = Vector3.new(sh.vel.X, 0, sh.vel.Z)
+                    if L.Magnitude <= 2 or vh.Magnitude <= 2 or D.Magnitude < 0.5 then return end
+                    if D:Dot(vh) <= 0 or D.Unit:Dot(vh.Unit) < 0.6 then return end
+                    local vb = sh.vb or 200
+                    local travel = (sh.d or 0) / vb
+                    if T.UseTravel and travel >= 0.1 then
+                        local tTrue = D:Dot(vh) / vh:Dot(vh)
+                        local tUsed = tTrue / math.max(sh.mult or 1, 0.2)
+                        local kTrue = (tUsed - (sh.base or 0)) / travel
+                        local k = tonumber(VD.TOF_TravelK) or 0.5
+                        VD.TOF_TravelK = math.clamp(k + (math.clamp(kTrue, 0, 2.5) - k) * 0.25, 0, 2.5)
+                    else
+                        local ratio = math.clamp(D:Dot(L) / L:Dot(L), 0, 2.5)
+                        local key = "TOF_HitGain" .. (sh.band or "M")
+                        local g = tonumber(VD[key]) or 1
+                        VD[key] = math.clamp(g + (g * ratio - g) * 0.3, 0.3, 2)
+                    end
+                end)
+            end
+        end)
+    end
+
+    task.spawn(function()
+        local rs = game:GetService("ReplicatedStorage")
+        local function try(d)
+            if d.Name == "VisualizeBullet"
+               and (d:IsA("RemoteEvent") or d.ClassName == "UnreliableRemoteEvent") then
+                pcall(HookBullet, d)
+            end
+        end
+        for _, d in ipairs(rs:GetDescendants()) do try(d) end
+        rs.DescendantAdded:Connect(try)
+    end)
+
+    task.spawn(function()
+        local rs = game:GetService("ReplicatedStorage")
+        local r = rs:WaitForChild("Remotes", 15)
+        r = r and r:WaitForChild("Mechanics", 15)
+        r = r and r:WaitForChild("NetRemote", 15)
+        if not r then return end
+        r.OnClientEvent:Connect(function(pkt)
+            if not (T.SmartPredict and T.UseSnap) then return end
+            if type(pkt) ~= "table" or pkt.kind ~= "Snapshot" then return end
+            local dd = pkt.data
+            if type(dd) ~= "table" or type(dd.players) ~= "table" or type(dd.t) ~= "number" then return end
+            local nowc = os.clock()
+            for _, pe in pairs(dd.players) do
+                if type(pe) == "table" and typeof(pe.pos) == "Vector3" and type(pe.id) == "number" then
+                    local e = SnapBuf[pe.id]
+                    if not e then e = { s = {} }; SnapBuf[pe.id] = e end
+                    local sb = e.s
+                    local last = sb[#sb]
+                    if not last or dd.t > last.ts then
+                        if last and (pe.pos - last.pos).Magnitude / math.max(dd.t - last.ts, 0.001) > 250 then
+                            e.s = {}; sb = e.s
+                        end
+                        sb[#sb + 1] = { ts = dd.t, pos = pe.pos, tl = nowc }
+                        while #sb > 24 do table.remove(sb, 1) end
+                    end
+                end
+            end
+        end)
+    end)
+
+    function SP.GetSnap(char)
+        local pl = char and Players:GetPlayerFromCharacter(char)
+        local e  = pl and SnapBuf[pl.UserId]
+        if not e then return nil end
+        local sb, n = e.s, #(e.s)
+        if n < 3 then return nil end
+        local last = sb[n]
+        if os.clock() - last.tl > 0.4 then return nil end
+        local function seg(t0, t1)
+            local a, b
+            for i = 1, n do
+                local x   = sb[i]
+                local age = last.ts - x.ts
+                if age >= t0 and age <= t1 then
+                    if not a then a = x end
+                    b = x
+                end
+            end
+            if a and b and b.ts - a.ts >= 0.07 then
+                local v = (b.pos - a.pos) / (b.ts - a.ts)
+                return Vector3.new(v.X, 0, v.Z), v.Y
+            end
+        end
+        local w0, vy = seg(0, 0.15)
+        if not w0 then return nil end
+        local vNow = seg(0, 0.1)
+        local vs = vNow or w0
+        if vs.Magnitude < 1 then vs = Vector3.zero end
+        local w1, w2 = seg(0.15, 0.3), seg(0.3, 0.45)
+        local conf, omega = 1, 0
+        local function turn(a, b)
+            if not (a and b) or a.Magnitude < 2 or b.Magnitude < 2 then return nil end
+            local phi = math.atan2(a.Z, a.X) - math.atan2(b.Z, b.X)
+            if phi > math.pi then phi = phi - 2*math.pi elseif phi < -math.pi then phi = phi + 2*math.pi end
+            return phi
+        end
+        local flips = 0
+        if w0 and w1 and w0.Magnitude > 2 and w1.Magnitude > 2 and w0.Unit:Dot(w1.Unit) < 0.2 then flips = flips + 1 end
+        if w1 and w2 and w1.Magnitude > 2 and w2.Magnitude > 2 and w1.Unit:Dot(w2.Unit) < 0.2 then flips = flips + 1 end
+        if flips >= 2 then
+            local net = seg(0, 0.45)
+            vs = net or Vector3.zero
+            if vs.Magnitude < 1.5 then vs = Vector3.zero end
+            return { pos = last.pos, tl = last.tl, vel = vs, vy = vy or 0, conf = 0.6, omega = 0 }
+        end
+        local p1, p2 = turn(w1, w0), turn(w2, w1)
+        if p1 and p2 and math.abs(p1) > 0.08 and math.abs(p2) > 0.08 then
+            if p1 * p2 > 0 then
+                omega = math.clamp((p1 + p2) / 2 / 0.15, -8, 8)
+            else
+                conf = 0.5
+            end
+        end
+        return { pos = last.pos, tl = last.tl, vel = vs, vy = vy or 0, conf = conf, omega = omega }
+    end
+
+    function SP.SampleVel(char)
+        local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+        if not (root and root:IsA("BasePart")) then return end
+        local S = Track[char]
+        if not S then
+            S = { s = {}, pend = {}, mAuto = 1, conf = 1, omega = 0,
+                  vShort = Vector3.zero, lead = Vector3.zero, leadT = 0, lastPend = 0 }
+            Track[char] = S
+        end
+        local now, pos = os.clock(), root.Position
+        local s = S.s
+        local last = s[#s]
+        if last then
+            if now - last.t < 0.004 then return end
+            if (pos - last.pos).Magnitude / (now - last.t) > 200 then
+                S.s = {}; S.pend = {}; S.lead = Vector3.zero; s = S.s
+            end
+        end
+        s[#s + 1] = { t = now, pos = pos }
+        while #s > 2 and now - s[1].t > 0.45 do table.remove(s, 1) end
+
+        local function seg(t0, t1)
+            local a, b
+            for i = 1, #s do
+                local e = s[i]
+                if e.t >= now - t1 and e.t <= now - t0 then
+                    if not a then a = e end
+                    b = e
+                end
+            end
+            if a and b and b.t - a.t >= 0.04 then
+                local v = (b.pos - a.pos) / (b.t - a.t)
+                return Vector3.new(v.X, 0, v.Z), v.Y
+            end
+        end
+        local vs, vy = seg(0, 0.15)
+        vs = vs or Vector3.zero
+        S.vy = vy or 0
+        if vs.Magnitude < 1 then vs = Vector3.zero end
+        local vl = seg(0.15, 0.4)
+        local conf = 1
+        if vl and vs.Magnitude > 1 and vl.Magnitude > 1 then
+            conf = math.clamp(vs.Unit:Dot(vl.Unit), 0.25, 1)
+        end
+        S.vShort, S.conf = vs, conf
+        -- acceleration (speeding up / braking), smoothed; only the part along the direction of travel is used
+        if vl and conf > 0.55 then
+            local a = (vs - vl) / 0.2
+            if a.Magnitude > 60 then a = a.Unit * 60 end
+            S.acc = (S.acc or Vector3.zero) * 0.6 + a * 0.4
+        else
+            S.acc = (S.acc or Vector3.zero) * 0.5
+        end
+        if vl and vs.Magnitude > 2 and vl.Magnitude > 2 then
+            local phi = math.atan2(vl.Z, vl.X) - math.atan2(vs.Z, vs.X)
+            if phi > math.pi then phi = phi - 2*math.pi elseif phi < -math.pi then phi = phi + 2*math.pi end
+            S.omega = S.omega * 0.5 + math.clamp(phi / 0.2, -8, 8) * 0.5
+        else
+            S.omega = S.omega * 0.8
+        end
+
+        S.vIn, S.stopping, S.air = nil, false, false
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local md  = hum.MoveDirection
+            local mdh = Vector3.new(md.X, 0, md.Z)
+            if mdh.Magnitude > 0.1 then
+                if not S.hadInput then S.inT0 = now; S.holdT0 = now end
+                local dirNow = mdh.Unit
+                if S.inDir and S.inDir:Dot(dirNow) < 0.9 then S.inT0 = now end
+                S.inDir = dirNow
+                S.hadInput = true
+                local wsNow = hum.WalkSpeed
+                if wsNow > 0 and (now - (S.holdT0 or now)) > 0.15 and vs.Magnitude < 0.3 * wsNow then
+                    if not S.blocked then S.blocked = true; S.blockDir = dirNow end
+                elseif wsNow > 0 and vs.Magnitude >= 0.5 * wsNow then
+                    S.blocked = false
+                end
+                if vs.Magnitude > 2 then S.mdWorks = true end
+                if vs.Magnitude > 2 then
+                    S.vIn = mdh.Unit * vs.Magnitude
+                elseif hum.WalkSpeed > 0 then
+                    S.vIn = mdh.Unit * hum.WalkSpeed * 0.6
+                end
+            else
+                S.hadInput = false
+                S.blocked, S.inDir = false, nil
+                if S.mdWorks then S.stopping = true end
+            end
+            local okf, fm = pcall(function() return hum.FloorMaterial end)
+            S.air = okf and fm == Enum.Material.Air
+        end
+
+        local pend = S.pend
+        if T.SmartPredict then
+            if vs.Magnitude > 2 and conf > 0.7 and now - S.lastPend > 0.06 and #pend < 24 then
+                local tau = SP.Delay()
+                S.lastPend = now
+                pend[#pend + 1] = { due = now + tau, base = pos, vl = vs * tau }
+            end
+            local i = 1
+            while i <= #pend do
+                local pd = pend[i]
+                if now >= pd.due then
+                    local disp = pos - pd.base
+                    disp = Vector3.new(disp.X, 0, disp.Z)
+                    local den = pd.vl:Dot(pd.vl)
+                    if den > 1 then
+                        local m = math.clamp(disp:Dot(pd.vl) / den, 0, 2.5)
+                        S.mAuto = S.mAuto + (m - S.mAuto) * 0.12
+                    end
+                    table.remove(pend, i)
+                else
+                    i = i + 1
+                end
+            end
+        elseif #pend > 0 then
+            S.pend = {}
+        end
+    end
+
+    function SP.Compute(t, tc, op, d)
+        LastReal, LastPred = nil, nil
+        if not (T.SmartPredict and tc) then return nil end
+
+        SP.SampleVel(tc)
+        local S = Track[tc]
+        if not S then return nil end
+
+        local SN   = T.UseSnap and SP.GetSnap(tc) or nil
+        local hrpR = tc:FindFirstChild("HumanoidRootPart")
+        if SN and (not hrpR or (SN.pos - hrpR.Position).Magnitude > 50) then SN = nil end
+        if SN then
+            S.vShort, S.vy, S.omega, S.conf = SN.vel, SN.vy, SN.omega, SN.conf
+        end
+
+        local vel  = S.vShort or Vector3.zero
+        local nowc = os.clock()
+        if S.vIn then
+            local startingUp = S.inT0 and (nowc - S.inT0) < 0.25
+            local exiting = S.blocked and S.blockDir and S.vIn.Magnitude > 0.1
+                and S.vIn.Unit:Dot(S.blockDir) < 0.85
+            if exiting then
+                vel = S.vIn.Unit * math.max(vel.Magnitude, S.vIn.Magnitude * 0.8)
+            elseif startingUp or vel.Magnitude >= 0.5 * S.vIn.Magnitude then
+                vel = vel:Lerp(S.vIn, startingUp and 0.6 or 0.5)
+            end
+        elseif S.stopping then
+            vel = vel * 0.3
+        end
+
+        local vy = S.vy or 0
+        if not (vel.Magnitude > 1 or (S.air and math.abs(vy) > 1)) then
+            S.lead  = Vector3.zero
+            S.leadT = nowc
+            return nil
+        end
+
+        if d < 5 then
+            S.lead  = Vector3.zero
+            S.leadT = nowc
+            return nil
+        end
+
+        local tp = t.Position
+        local mult = math.clamp(
+            math.clamp(S.mAuto, 0.2, 1.8) * SP.ConfEff(S)
+                * (tonumber(VD["TOF_HitGain" .. SP.Band(d)]) or 1),
+            0.3, 1.6
+        )
+
+        local base = SP.Delay()
+        local vb   = math.max(tonumber(VD.TOF_BulletSpeed) or 800, 50)
+        local kT   = T.UseTravel and math.clamp(tonumber(VD.TOF_TravelK) or 0.5, 0, 2.5) or 0
+        local om   = S.omega or 0
+        local ex, snapOff, realBase = 0, Vector3.zero, tp
+        if SN then
+            ex = math.clamp(os.clock() - SN.tl, 0, 0.15)
+            local off = hrpR and (tp - hrpR.Position) or Vector3.zero
+            realBase = SN.pos + off
+            snapOff  = realBase - tp
+        end
+
+        local leadScale = math.clamp((tonumber(T.LeadScale) or 100) / 100, 0.5, 2.5)
+        local humT = tc:FindFirstChildOfClass("Humanoid")
+        local function leadFor(dl0)
+            local dl = dl0 + ex
+            local ld = vel * dl * mult
+            -- speed change along the run direction: keeps accelerating up to run speed, or brakes to a stop
+            if vel.Magnitude > 2 and S.acc and math.abs(om) <= 0.35 then
+                local u = vel.Unit
+                local aPar = S.acc:Dot(u) * 0.6
+                if math.abs(aPar) > 3 then
+                    local s0 = vel.Magnitude
+                    local smax = math.max(s0, ((humT and humT.WalkSpeed) or s0) * 1.15)
+                    local te = aPar < 0 and math.min(dl, s0 / -aPar) or math.min(dl, (smax - s0) / aPar)
+                    local disp = s0 * te + 0.5 * aPar * te * te
+                    if aPar > 0 then disp = disp + smax * (dl - te) end
+                    ld = u * (math.max(disp, 0) * mult)
+                end
+            end
+            ld = ld * leadScale
+            if vel.Magnitude > 2 and math.abs(om) > 0.35 then
+                local lim = math.rad(100) / math.max(dl, 0.05)
+                local omE = math.clamp(om * 0.7, -lim, lim)
+                ld = SP.ArcDisp(vel, omE, dl) * mult
+            end
+            local cap = math.clamp(math.max(d * 0.6, vel.Magnitude * dl * mult * 1.2), 3, 120)
+            if ld.Magnitude > cap then ld = ld.Unit * cap end
+            return ld
+        end
+
+        local delay = base + kT * d / vb
+        local lead  = leadFor(delay)
+        if kT > 0 then
+            for _ = 1, 2 do
+                delay = base + kT * (tp + lead - op).Magnitude / vb
+                lead  = leadFor(delay)
+            end
+        end
+
+        local dy = 0
+        if S.air then
+            dy = vy * delay - 0.5 * workspace.Gravity * delay * delay
+            local okr, hit = pcall(function()
+                local rp2 = RaycastParams.new()
+                rp2.FilterType = Enum.RaycastFilterType.Exclude
+                rp2.FilterDescendantsInstances = { tc, LP.Character }
+                return workspace:Raycast(tp, Vector3.new(0, -300, 0), rp2)
+            end)
+            if okr and hit then dy = math.max(dy, -((tp.Y - hit.Position.Y) - 1)) end
+            dy = math.clamp(dy, -40, 25)
+        end
+
+        if T.WallCheck then
+            local lh = Vector3.new(lead.X, 0, lead.Z)
+            if lh.Magnitude > 1.5 then
+                local okw, wh = pcall(function()
+                    local rp3 = RaycastParams.new()
+                    rp3.FilterType = Enum.RaycastFilterType.Exclude
+                    rp3.RespectCanCollide = true
+                    local ex2 = { tc, LP.Character }
+                    for _, pl2 in ipairs(Players:GetPlayers()) do
+                        if pl2.Character then ex2[#ex2 + 1] = pl2.Character end
+                    end
+                    rp3.FilterDescendantsInstances = ex2
+                    return workspace:Raycast(realBase, lh, rp3)
+                end)
+                if okw and wh then
+                    local wd = math.max((wh.Position - realBase).Magnitude - 1.2, 0)
+                    lead = lh.Unit * math.min(wd, lh.Magnitude) + Vector3.new(0, lead.Y, 0)
+                end
+            end
+        end
+
+        lead = lead + snapOff
+        lead = Vector3.new(lead.X, dy + snapOff.Y, lead.Z)
+        LastReal = realBase
+        LastVel, LastMult, LastBase, LastVB = vel, mult, base, vb
+
+        local dt = math.clamp(nowc - S.leadT, 0, 0.2)
+        S.leadT = nowc
+        local sm   = math.clamp((tonumber(T.LineSmooth) or 70) / 100, 0, 1)
+        local rate = 80 * (1 - sm) + 8 * sm
+        S.lead = S.lead:Lerp(lead, math.clamp(dt * rate, 0.05, 1))
+        local aimPos = tp + (RawMode and lead or S.lead)
+
+        LastPred = {
+            tc = tc, real = LastReal or tp, aim = aimPos, band = SP.Band(d),
+            vel = LastVel, mult = LastMult, base = LastBase, d = d, vb = LastVB,
+        }
+        return aimPos
+    end
+
+    function SP.RecordShot()
+        local lp = LastPred
+        if not lp then return end
+        Shot = {
+            t = os.clock(), tc = lp.tc, real = lp.real, aim = lp.aim, band = lp.band,
+            vel = lp.vel, mult = lp.mult, base = lp.base, d = lp.d, vb = lp.vb, used = false,
+        }
+    end
+
+    function SP.SetRawMode(v) RawMode = v == true end
+    SP.Track = Track
+
+    track(RunService.Heartbeat:Connect(function()
+        if unloaded or not T.SmartPredict then return end
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP and p.Character then SP.SampleVel(p.Character) end
+        end
+    end))
+
+    return SP
+end)()
+
+
+State.SilentObj = (function()
+	local T = State.TOFSilent
+	local obj = {}
+	local effects, original
+	local installing = false
+
+	local killerCache, killerCacheAt = nil, 0
+	local function killerChar()
+		local now = os.clock()
+		if killerCache and killerCache.Parent and now - killerCacheAt < 0.5 then return killerCache end
+		killerCacheAt = now
+		killerCache = nil
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP and p.Character then
+				local team = p.Team and string.lower(p.Team.Name) or ""
+				if string.find(team, "killer", 1, true) or p.Character:FindFirstChild("Lookscriptkiller", true) then
+					killerCache = p.Character
+					return killerCache
+				end
+			end
+		end
+		return nil
+	end
+
+	local function targetPart(ch)
+		local pick = T.AimPart
+		if pick == "Head" then
+			local h = ch:FindFirstChild("Head")
+			if h then return h end
+		elseif pick == "HumanoidRootPart" then
+			local r = ch:FindFirstChild("HumanoidRootPart")
+			if r then return r end
+		end
+		return ch:FindFirstChild("UpperTorso") or ch:FindFirstChild("Torso") or ch:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function hasTOF(ch)
+		if not ch then return false end
+		if ch:FindFirstChild("Twist of Fate") then return true end
+		local eq = string.lower(tostring(LP:GetAttribute("EquippedItem") or ""))
+		return eq:find("twist", 1, true) ~= nil or eq:find("fate", 1, true) ~= nil
+	end
+
+	local function muzzle(ch)
+		return getTOFLaserOrigin(ch)
+	end
+
+	local PROJ_SPEED = 800
+	local LEAD_MAX_TIME = 0.5
+	local LEAD_MAX_DIST = 16
+	local NEAR_START = 1
+	local NEAR_FULL = 5
+	local INTERP_DELAY = 0.05
+	local HISTORY_WINDOW = 0.12
+	local HISTORY_KEEP = 1.4
+	local VEL_CAP = 60
+	local Y_VEL_CLAMP = 14
+	local TELEPORT_STEP = 12
+	local history = setmetatable({}, { __mode = "k" })
+
+	local function record(part, now)
+		local list = history[part]
+		if not list then
+			list = {}
+			history[part] = list
+		end
+		local pos = part.Position
+		local last = list[#list]
+		if last and (pos - last.p).Magnitude > TELEPORT_STEP then
+			table.clear(list)
+		end
+		list[#list + 1] = { t = now, p = pos }
+		while #list > 2 and now - list[1].t > HISTORY_KEEP do
+			table.remove(list, 1)
+		end
+	end
+
+	local function limitVel(v)
+		v = Vector3.new(v.X, math.clamp(v.Y, -Y_VEL_CLAMP, Y_VEL_CLAMP), v.Z)
+		if v.Magnitude > VEL_CAP then v = v.Unit * VEL_CAP end
+		return v
+	end
+
+	local function flat(v)
+		return Vector3.new(v.X, 0, v.Z)
+	end
+
+	local function latencyLead()
+		local ok, ping = pcall(function() return LP:GetNetworkPing() end)
+		local rtt = (ok and type(ping) == "number" and ping > 0) and math.clamp(ping, 0.02, 0.4) or 0.08
+		return (rtt + INTERP_DELAY) * 0.8
+	end
+
+	track(RunService.Heartbeat:Connect(function()
+		if unloaded or not (T.Enabled and not T.SmartPredict and T.Predict) then return end
+		local kc = killerChar()
+		local part = kc and targetPart(kc)
+		if part then record(part, os.clock()) end
+	end))
+
+	local function observedVel(part)
+		local list = history[part]
+		if not list or #list < 3 then return nil end
+		if os.clock() - list[#list].t > 0.15 then return nil end
+		return State.Motion.Regress(list, list[#list].t, 0.14, 0.07)
+	end
+
+	local function getVelocity(part, hrp, hum)
+		local base = hrp.AssemblyLinearVelocity
+		local obs = observedVel(part)
+		if obs and obs.Magnitude > 3 and obs.Magnitude < 120 then
+			local bf = flat(base)
+			if bf.Magnitude < 1.5 or flat(obs):Dot(bf) < 0 then base = obs end
+		end
+		if hum then
+			local md = hum.MoveDirection
+			if md.Magnitude > 0.05 then
+				local intent = md * hum.WalkSpeed
+				local bf = flat(base)
+				if bf.Magnitude > 0.5 and flat(intent):Dot(bf) < 0 then base = intent end
+			end
+		end
+		return limitVel(base)
+	end
+
+	local lastMoveAt = setmetatable({}, { __mode = "k" })
+	local function aimPoint(part, from)
+		local pos = part.Position
+		if T.SmartPredict then
+			if not T.Predict then return pos end
+			local ch = part.Parent
+			if ch then
+				local aimPos = State.SmartPredict.Compute(part, ch, from, (pos - from).Magnitude)
+				if aimPos then return aimPos end
+			end
+			return pos
+		end
+		if not T.Predict then return pos end
+		do
+			local ch0 = part.Parent
+			local hrp0 = ch0 and ch0:FindFirstChild("HumanoidRootPart")
+			local hum0 = ch0 and ch0:FindFirstChildOfClass("Humanoid")
+			local now = os.clock()
+			local moving = false
+			if hrp0 then
+				local v1 = flat(hrp0.AssemblyLinearVelocity).Magnitude
+				local v2 = flat(getVelocity(part, hrp0, hum0)).Magnitude
+				moving = v1 > 2.5 or v2 > 2.5
+			end
+			if moving or not lastMoveAt[part] then lastMoveAt[part] = now end
+			if now - lastMoveAt[part] > 0.25 then return pos end
+		end
+		if not T.Predict then return pos end
+		local ch = part.Parent
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		if not hrp then return pos end
+		local vel = hrp.AssemblyLinearVelocity
+		if vel.Magnitude < 1 then return pos end
+		local timeToHit = (pos - from).Magnitude / PROJ_SPEED
+		local predicted = pos
+		for _ = 1, 3 do
+			predicted = pos + vel * timeToHit
+			timeToHit = (predicted - from).Magnitude / PROJ_SPEED
+		end
+		return predicted
+	end
+
+	local function inFov(pos)
+		local cam = workspace.CurrentCamera
+		if not cam then return false end
+		local to = pos - cam.CFrame.Position
+		if to.Magnitude < 0.1 then return true end
+		local dot = math.clamp(cam.CFrame.LookVector:Dot(to.Unit), -1, 1)
+		return math.deg(math.acos(dot)) <= (tonumber(T.FOV) or 120) / 2
+	end
+
+	local function compute(character, ignoreFov)
+		local kc = killerChar()
+		local part = kc and targetPart(kc)
+		if not part then return nil end
+		local from = muzzle(character)
+		if not from then return nil end
+		local pos = aimPoint(part, from)
+		if not ignoreFov and not inFov(pos) then return nil end
+		local d = pos - from
+		if d.Magnitude < 0.01 then return nil end
+		return d.Unit
+	end
+
+	local circleGui, circleFrame, laserPart
+	local activeTool, toolConns = nil, {}
+	local isFiring, releaseUntil = false, 0
+	local lastAimDir, lastAimAt = nil, 0
+
+	local function clearToolConnections()
+		for _, c in ipairs(toolConns) do pcall(function() c:Disconnect() end) end
+		table.clear(toolConns)
+		activeTool = nil
+		isFiring, releaseUntil = false, 0
+	end
+
+	local mouseHeld = false
+	toolConns[#toolConns + 1] = track(UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			mouseHeld = true
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			mouseHeld = false
+			releaseUntil = tick() + 0.12
+		end
+	end))
+
+	local BULLET_LASER_MAX = 500
+
+	local function bindActiveTool(ch)
+		local tool = ch and ch:FindFirstChild("Twist of Fate")
+		if tool == activeTool then return end
+		clearToolConnections()
+		mouseHeld = false
+		if not (tool and tool:IsA("Tool")) then return end
+		activeTool = tool
+		toolConns[#toolConns + 1] = tool.Activated:Connect(function()
+			isFiring = true
+			releaseUntil = 0
+		end)
+		toolConns[#toolConns + 1] = tool.Deactivated:Connect(function()
+			State.AimHold.held = false
+			isFiring = false
+			releaseUntil = tick() + 0.12
+		end)
+		toolConns[#toolConns + 1] = tool.Unequipped:Connect(function()
+			State.AimHold.held = false
+			isFiring = false
+			releaseUntil = 0
+		end)
+	end
+
+	local function ensureCircle()
+		if circleGui and circleGui.Parent then return true end
+		local parent
+		pcall(function() parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+		parent = parent or LP:FindFirstChildOfClass("PlayerGui")
+		if not parent then return false end
+		local sg = Instance.new("ScreenGui")
+		sg.Name = "KINON_TOFSilentFOV"
+		sg.ResetOnSpawn = false
+		sg.IgnoreGuiInset = true
+		sg.DisplayOrder = 20
+		local f = Instance.new("Frame")
+		f.AnchorPoint = Vector2.new(0.5, 0.5)
+		f.Position = UDim2.fromScale(0.5, 0.5)
+		f.BackgroundTransparency = 1
+		f.BorderSizePixel = 0
+		f.Parent = sg
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(1, 0)
+		corner.Parent = f
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.fromRGB(255, 255, 255)
+		stroke.Thickness = 1.5
+		stroke.Transparency = 0.2
+		stroke.Parent = f
+		local ok = pcall(function() sg.Parent = parent end)
+		if not ok then return false end
+		circleGui, circleFrame = sg, f
+		return true
+	end
+
+	local function circleRadius(cam)
+		local half = math.rad(math.clamp((tonumber(T.FOV) or 120) / 2, 1, 85))
+		local halfV = math.rad(cam.FieldOfView) / 2
+		local r = (cam.ViewportSize.Y / 2) * math.tan(half) / math.tan(halfV)
+		local visibleCap = math.min(cam.ViewportSize.X, cam.ViewportSize.Y) * 0.48
+		return math.clamp(r, 12, visibleCap)
+	end
+
+	local function hideLaser()
+		if laserPart then laserPart.Transparency = 1 end
+	end
+
+	local function updateLaser(from, to)
+		if not (laserPart and laserPart.Parent) then
+			local p = Instance.new("Part")
+			p.Name = "KINON_TOFSilentLaser"
+			p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+			p.Material = Enum.Material.Neon
+			p.Color = Color3.fromRGB(255, 60, 60)
+			p.Transparency = 1
+			p.Parent = workspace
+			laserPart = p
+		end
+		local dist = (to - from).Magnitude
+		if dist < 0.5 then return hideLaser() end
+		local thick = math.clamp(dist * 0.0015, 0.12, 0.3)
+		laserPart.Size = Vector3.new(thick, thick, dist)
+		laserPart.CFrame = CFrame.new((from + to) / 2, to)
+		laserPart.Transparency = 0
+	end
+
+	local aimRay = RaycastParams.new()
+	aimRay.FilterType = Enum.RaycastFilterType.Exclude
+	aimRay.RespectCanCollide = true
+
+	local function drawAimLaser(ch, from, dir)
+		aimRay.FilterDescendantsInstances = { ch }
+		local res = workspace:Raycast(from, dir * BULLET_LASER_MAX, aimRay)
+		updateLaser(from, res and res.Position or (from + dir * BULLET_LASER_MAX))
+	end
+
+	local renderBindName = "KINON_TOFSilentLaser_" .. tostring(LP.UserId)
+	pcall(function() RunService:UnbindFromRenderStep(renderBindName) end)
+	RunService:BindToRenderStep(renderBindName, Enum.RenderPriority.Last.Value, function()
+		local active = T.Enabled and not unloaded
+		local cam = workspace.CurrentCamera
+		if active and T.ShowCircle and cam and ensureCircle() then
+			circleGui.Enabled = true
+			local r = circleRadius(cam)
+			circleFrame.Size = UDim2.fromOffset(r * 2, r * 2)
+		elseif circleGui then
+			circleGui.Enabled = false
+		end
+
+		if not active or not T.ShowLaser then return hideLaser() end
+		local ch = LP.Character
+		bindActiveTool(ch)
+		if not hasTOF(ch) then State.AimHold.held = false; return hideLaser() end
+		if State.AimHold.ok and not State.AimHold.held then return hideLaser() end
+		local from = muzzle(ch)
+		if not from then return hideLaser() end
+		local good, dir = pcall(compute, ch, true)
+		if not (good and typeof(dir) == "Vector3") then
+			dir = nil
+			if cam then
+				aimRay.FilterDescendantsInstances = { ch }
+				local hit = workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * BULLET_LASER_MAX, aimRay)
+				local target = hit and hit.Position or (cam.CFrame.Position + cam.CFrame.LookVector * BULLET_LASER_MAX)
+				local d = target - from
+				dir = d.Magnitude > 0.5 and d.Unit or cam.CFrame.LookVector
+			end
+		end
+		if not dir then return hideLaser() end
+		pcall(drawAimLaser, ch, from, dir)
+	end)
+
+	local function restore()
+		if effects and original then
+			pcall(function() effects.aimDirection = original end)
+		end
+	end
+
+	local function install()
+		if original or installing then return end
+		installing = true
+		task.spawn(function()
+			local ok = pcall(function()
+				local rs = game:GetService("ReplicatedStorage")
+				local m = rs:WaitForChild("Modules", 10):WaitForChild("Items", 10):WaitForChild("TwistOfFate", 10):WaitForChild("TwistoffateEffects", 10)
+				local e = require(m)
+				local orig = e.aimDirection
+				if type(orig) ~= "function" then error("no aimDirection") end
+				e.aimDirection = function(character, camCF)
+					if unloaded or not T.Enabled then return orig(character, camCF) end
+					if T.SmartPredict then State.SmartPredict.SetRawMode(true) end
+					local good, dir = pcall(compute, character)
+					if T.SmartPredict then State.SmartPredict.SetRawMode(false) end
+					if good and dir then
+						lastAimDir, lastAimAt = dir, tick()
+						if T.SmartPredict then State.SmartPredict.RecordShot() end
+						return dir
+					end
+					local res = orig(character, camCF)
+					if typeof(res) == "Vector3" then lastAimDir, lastAimAt = res, tick() end
+					return res
+				end
+				effects, original = e, orig
+			end)
+			installing = false
+			if ok and unloaded then restore() end
+		end)
+	end
+
+	function obj:Refresh()
+		if T.Enabled then State.AimHold.Install(); install() end
+	end
+
+	function obj:Destroy()
+		T.Enabled = false
+		pcall(function() RunService:UnbindFromRenderStep(renderBindName) end)
+		clearToolConnections()
+		mouseHeld = false
+		restore()
+		if circleGui then pcall(function() circleGui:Destroy() end) end
+		if laserPart then pcall(function() laserPart:Destroy() end) end
+	end
+
+	return obj
+end)()
+
+Hooks.TOFSilent = function(s)
+	State.SilentObj:Refresh()
+end
+end
+
 
 
 
@@ -3027,47 +4197,25 @@ end
 local ParryCirclePart, ParryCircleAdornment
 
 local function KINON_ShouldPassFaceCheck(killerRoot, playerRoot)
-	if Parry.AggressiveMode then
+	if Z.AntiFakeHit or Parry.AggressiveMode then
 		return true
 	end
 	if not killerRoot or not playerRoot then
 		return false
 	end
-	local memo = Parry.FaceMemo
-	if not memo then
-		memo = setmetatable({}, { __mode = "k" })
-		Parry.FaceMemo = memo
-	end
-	local now = os.clock()
-	if memo[killerRoot] and now - memo[killerRoot] < 0.6 then
-		return true
-	end
+	-- cek sederhana: apakah killer sedang menghadap kita
 	local offset = playerRoot.Position - killerRoot.Position
-	local dist = offset.Magnitude
-	if dist <= 6 then
-		return true
-	end
-	local dir = offset.Unit
+	offset = Vector3.new(offset.X, 0, offset.Z)
+	local look = killerRoot.CFrame.LookVector
+	look = Vector3.new(look.X, 0, look.Z)
+	if offset.Magnitude < 0.05 or look.Magnitude < 0.05 then return true end
 	local sensitivity = math.clamp(tonumber(Parry.FaceSensitivity) or 10, 0, 10) / 10
 	local maxAngle = 20 + sensitivity * 100
-	local cosLimit = math.cos(math.rad(maxAngle))
-	local passed = killerRoot.CFrame.LookVector:Dot(dir) >= cosLimit
-	if not passed then
-		local model = killerRoot.Parent
-		local head = model and model:FindFirstChild("Head")
-		if head and head:IsA("BasePart") and head.CFrame.LookVector:Dot(dir) >= cosLimit then
-			passed = true
-		end
-	end
-	if not passed then
-		local vel = killerRoot.AssemblyLinearVelocity
-		if vel and vel.Magnitude > 8 then
-			local velLimit = math.cos(math.rad(math.min(maxAngle + 20, 150)))
-			if vel.Unit:Dot(dir) >= velLimit then passed = true end
-		end
-	end
-	if passed then memo[killerRoot] = now end
-	return passed
+	-- killer dekat sedang memutar badan saat mengayun: sudut dilonggarkan supaya tidak telat
+	local dist = offset.Magnitude
+	if dist <= 2.5 then return true end
+	if dist <= 7 then maxAngle = math.min(maxAngle + 45, 160) end
+	return look.Unit:Dot(offset.Unit) >= math.cos(math.rad(maxAngle))
 end
 
 local function CreateCustomParryGUI()
@@ -3250,7 +4398,7 @@ if CustomParryGui then CustomParryGui.Enabled = false end
 Parry.ShouldPassFaceCheck = KINON_ShouldPassFaceCheck
 
 do -- Kinon parry engine (fast mode, cooldown tracking, safety checks)
-local ParryV2 = { Enabled = false, Range = 14, ReachBonus = 0, FaceSensitivity = 6, AggressiveMode = true, SafetyParry = true }
+local ParryV2 = { Enabled = false, Range = 14, FaceSensitivity = 6, AggressiveMode = true, SafetyParry = false }
 local KINON_ParryEngine = {
 	LastAttempt = 0,
 	LastSuccess = 0,
@@ -3668,15 +4816,52 @@ local function KINON_ActionBusy(character)
 end
 
 
-local KINON_SafetyAttrs = { "isVaulting", "isRepairing", "isUnhooking", "isHealing", "isSliding" }
+local KINON_SafetyAttrs = { "isVaulting", "isSliding", "isRepairing", "isUnhooking", "isHealing" }
+-- atribut vault/slide sering telat mati: hanya memblokir sebentar sejak mulai menyala
+local KINON_SafetyCap = { isVaulting = 0.3, isSliding = 0.3, isRepairing = 6, isUnhooking = 6, isHealing = 6 }
+-- aksi di tempat (repair/unhook/heal) hanya dianggap nyata kalau kamu memang diam; vault/slide kalau memang bergerak
+local KINON_SafetyStill = { isRepairing = true, isUnhooking = true, isHealing = true }
+local KINON_SafetySince = {}
+local KINON_SafetyBound = setmetatable({}, { __mode = "k" })
+local function KINON_BindSafety(ci)
+	if KINON_SafetyBound[ci] then return end
+	KINON_SafetyBound[ci] = true
+	for _, attr in ipairs(KINON_SafetyAttrs) do
+		local function upd(initial)
+			if ci:GetAttribute(attr) == true then
+				-- sudah menyala sebelum dipantau = dianggap lama/macet, bukan aksi yang baru mulai
+				KINON_SafetySince[attr] = KINON_SafetySince[attr] or (initial and -1e9 or os.clock())
+			else
+				KINON_SafetySince[attr] = nil
+			end
+		end
+		upd(true)
+		track(ci:GetAttributeChangedSignal(attr):Connect(function() upd(false) end))
+	end
+end
 local function KINON_IsSafeToParry(char)
 	local on = (Parry.Enabled and Parry.SafetyParry ~= false) or (ParryV2.Enabled and ParryV2.SafetyParry ~= false)
 	if not on then return true end
 	if not char then return false end
 	local ci = char:FindFirstChild("CheckInterractable")
 	if not ci then return true end
+	KINON_BindSafety(ci)
+	local now = os.clock()
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local v = root and root.AssemblyLinearVelocity or Vector3.zero
+	local speed = Vector3.new(v.X, 0, v.Z).Magnitude
 	for _, attr in ipairs(KINON_SafetyAttrs) do
-		if ci:GetAttribute(attr) == true then return false end
+		if ci:GetAttribute(attr) == true then
+			local since = KINON_SafetySince[attr] or -1e9
+			local cap = KINON_SafetyCap[attr] or 1
+			if now - since < cap then
+				if KINON_SafetyStill[attr] then
+					if speed < 3 then return false end
+				elseif speed >= 4 then
+					return false
+				end
+			end
+		end
 	end
 	return true
 end
@@ -3779,7 +4964,6 @@ local function KINON_InRangeAndFacing(killerRoot, playerRoot, positionOverride, 
 	if not killerRoot or not playerRoot then return false end
 	local distance = ((positionOverride or killerRoot.Position) - playerRoot.Position).Magnitude
 	local range = math.clamp(tonumber(Parry.Range) or 14, 5, 35)
-		+ math.clamp(tonumber(Parry.ReachBonus) or 0, 0, 10)
 	if distance > range then return false end
 	if not KINON_ShouldPassFaceCheck(killerRoot, playerRoot) then return false end
 	return true
@@ -4062,7 +5246,7 @@ local function KINON_ParryInRange(killerRoot, playerRoot, vel, isLunge, isOption
 	end
 	if ok then return false end
 	local d = (killerRoot.Position - playerRoot.Position).Magnitude
-	return d <= (tonumber(ParryV2.Range) or 14) + (tonumber(ParryV2.ReachBonus) or 0)
+	return d <= (tonumber(ParryV2.Range) or 14)
 end
 
 function Z.SetAntiFakeHit(value)
@@ -4095,7 +5279,6 @@ local function KINON_FakeHitBlocked(animTrack, killerRoot, playerRoot, vel)
 		local rawDist = (killerRoot.Position - playerRoot.Position).Magnitude
 		local dist = (predictedKillerPos - predictedMyPos).Magnitude
 		local baseRange = math.clamp(tonumber(Parry.Range) or 14, 5, 35)
-			+ math.clamp(tonumber(Parry.ReachBonus) or 0, 0, 10)
 
 		local relVelTowardMe = 0
 		local dirToMe = (predictedMyPos - predictedKillerPos)
@@ -4325,61 +5508,156 @@ end))
 
 
 
--- ===== AUTO TRAP SKILL CHECK (original lines 5194-5248) =====
-
 State.SkillCheckTrap = { On = false, Mode = "Legit" }
 do
 	local T = State.SkillCheckTrap
 	local conn
 	local busy = false
-	local function inRange(lineRot, goalRot)
-		local a = (goalRot + 102) % 360
-		local b = (goalRot + 116) % 360
-		if a > b then return lineRot >= a or lineRot <= b end
-		return lineRot >= a and lineRot <= b
+	local lastPrompt, promptStart = nil, 0
+
+	local function setShared(v)
+		local o = State.SkillCheckObj
+		if o then o._busy = v end
 	end
-	local function step()
-		if unloaded or Z.ZirthHubSession ~= session or not T.On or busy then return end
-		local pg = LP:FindFirstChildOfClass("PlayerGui")
-		if not pg then return end
+
+	local function trapFire()
+		local o = State.SkillCheckObj
+		if o then o:_fireAction(0.02) end
+	end
+
+	local function pingSec()
+		local p = 0.06
+		pcall(function() p = LP:GetNetworkPing() end)
+		if type(p) ~= "number" or p ~= p or p <= 0 then p = 0.06 end
+		return p
+	end
+
+	local function findCheck(pg)
 		for _, name in ipairs({ "SkillCheckPromptGui", "SkillCheckPromptGui-con" }) do
 			local prompt = pg:FindFirstChild(name)
 			if prompt and prompt.Enabled ~= false then
-				local check = prompt:FindFirstChild("Check")
-				if check and check.Visible then
-					local line = check:FindFirstChild("Line")
-					if not line then return end
-					local target
-					for _, tn in ipairs({ "TrapPerfect", "TrapGoal" }) do
-						local c = check:FindFirstChild(tn)
-						if c and c.Visible then target = c; break end
-					end
-					if not target then return end
-					local press = false
-					if T.Mode == "Instant" then
-						line.Rotation = target.Rotation + 109
-						press = true
-					else
-						press = inRange(line.Rotation % 360, target.Rotation % 360)
-					end
-					if press then
-						busy = true
-						task.spawn(function()
-							pcall(function() State.SkillCheckObj:_fireAction() end)
-							task.wait(T.Mode == "Instant" and 0.4 or 0.05)
-							busy = false
-						end)
-					end
-					return
+				local c = prompt:FindFirstChild("Check") or prompt:FindFirstChild("check")
+				if c and c.Visible then return c end
+			end
+		end
+		for _, gui in ipairs(pg:GetChildren()) do
+			if gui:IsA("ScreenGui") and gui.Enabled ~= false then
+				local c = gui:FindFirstChild("Check") or gui:FindFirstChild("check")
+				if c and c.Visible and (c:FindFirstChild("Line") or c:FindFirstChild("line")) then return c end
+			end
+		end
+		return nil
+	end
+
+	local function step()
+		if unloaded or busy then return end
+		local genOn = State.SkillCheck and State.SkillCheck.Enabled == true
+		if not (T.On or genOn) then return end
+		local pg = LP:FindFirstChildOfClass("PlayerGui")
+		if not pg then return end
+		local check = findCheck(pg)
+		if not check then
+			lastPrompt = nil
+			State.TrapSpoofLine, State.TrapSpoofRot = nil, nil
+			return
+		end
+		local line = check:FindFirstChild("Line") or check:FindFirstChild("line")
+		if not line then return end
+
+		local trapGoal = check:FindFirstChild("TrapGoal") or check:FindFirstChild("trapGoal")
+		local trapPerfect = check:FindFirstChild("TrapPerfect") or check:FindFirstChild("trapPerfect")
+		local char = LP.Character
+		local trapped = char and (char:GetAttribute("Trapped") == true or char:GetAttribute("EscapingTrap") == true)
+		local isTrap = (trapGoal and trapGoal.Visible) or (trapPerfect and trapPerfect.Visible) or trapped
+		if not isTrap then
+			lastPrompt = nil
+			return
+		end
+
+		if check ~= lastPrompt then
+			lastPrompt = check
+			promptStart = os.clock()
+		end
+
+		local targetRot, zoneStart, zoneEnd
+		if trapGoal and trapGoal.Visible then
+			targetRot = (trapGoal.Rotation + 109) % 360
+			zoneStart = (trapGoal.Rotation + 104) % 360
+			zoneEnd = (trapGoal.Rotation + 115) % 360
+		elseif trapPerfect and trapPerfect.Visible then
+			targetRot = trapPerfect.Rotation % 360
+			zoneStart = (trapPerfect.Rotation - 5) % 360
+			zoneEnd = (trapPerfect.Rotation + 15) % 360
+		else
+			local goal = check:FindFirstChild("Goal") or check:FindFirstChild("goal")
+			local gr = goal and goal.Rotation or 0
+			targetRot = (gr + 109) % 360
+			zoneStart = (gr + 104) % 360
+			zoneEnd = (gr + 115) % 360
+		end
+
+		local mode = T.On and T.Mode or (State.SkillCheck and State.SkillCheck.Mode) or "Instant"
+		local ping = pingSec()
+		if mode == "Instant" then
+			local minWait = math.clamp(0.08 + ping * 0.4, 0.10, 0.18)
+			if os.clock() - promptStart < minWait then return end
+			busy = true
+			setShared(true)
+			if State.InstallRotationHook then pcall(State.InstallRotationHook) end
+			State.TrapSpoofLine, State.TrapSpoofRot = line, targetRot
+			line.Rotation = targetRot
+			task.spawn(function()
+				local lockActive = true
+				local lockConn = RunService.RenderStepped:Connect(function()
+					if lockActive and line and line.Parent then line.Rotation = targetRot end
+				end)
+				for _ = 1, 2 do
+					line.Rotation = targetRot
+					RunService.Heartbeat:Wait()
 				end
+				pcall(trapFire)
+				task.wait(0.10)
+				lockActive = false
+				if lockConn then lockConn:Disconnect() end
+				task.wait(0.15)
+				State.TrapSpoofLine, State.TrapSpoofRot = nil, nil
+				busy = false
+				setShared(false)
+			end)
+		else
+			local lead = math.clamp(ping * 100, 4, 16)
+			local lr = line.Rotation % 360
+			local sR = (zoneStart - lead) % 360
+			local inZone
+			if sR > zoneEnd then inZone = lr >= sR or lr <= zoneEnd else inZone = lr >= sR and lr <= zoneEnd end
+			if inZone then
+				busy = true
+				setShared(true)
+				task.spawn(function()
+					pcall(trapFire)
+					task.wait(0.2)
+					busy = false
+					setShared(false)
+				end)
 			end
 		end
 	end
+
+	conn = RunService.RenderStepped:Connect(function() pcall(step) end)
+
 	State.TrapSkillSet = function(v)
 		T.On = v == true
+		if not T.On then
+			State.TrapSpoofLine, State.TrapSpoofRot = nil, nil
+		end
+	end
+
+	State.TrapSkillDestroy = function()
+		T.On = false
 		if conn then conn:Disconnect(); conn = nil end
+		State.TrapSpoofLine, State.TrapSpoofRot = nil, nil
 		busy = false
-		if T.On then conn = RunService.RenderStepped:Connect(function() pcall(step) end) end
+		setShared(false)
 	end
 end
 
@@ -4830,7 +6108,7 @@ do
         end
     end
 
-    CreateMultiDropdown = function(parentFrame, titleText, items, settings, onChange, idPrefix, exclusive)
+    CreateMultiDropdown = function(parentFrame, titleText, items, settings, onChange, idPrefix, exclusive, noRegister)
         local wrap = Instance.new("Frame")
         wrap.Parent = parentFrame
         wrap.BackgroundColor3 = C.Card
@@ -4927,11 +6205,13 @@ do
         for _, it in ipairs(items) do
             local key = it[1]
             local id = (idPrefix or "dd") .. "_" .. string.lower(key)
-            ToggleRegistry[id] = {
-                name = titleText .. " - " .. it[2],
-                getState = function() return settings[key] == true end,
-                setState = function(v) apply(key, v) end,
-            }
+            if not noRegister then
+                ToggleRegistry[id] = {
+                    name = titleText .. " - " .. it[2],
+                    getState = function() return settings[key] == true end,
+                    setState = function(v) apply(key, v) end,
+                }
+            end
             table.insert(SearchItems, { name = it[2], obj = wrap })
         end
         table.insert(SearchItems, { name = titleText, obj = wrap })
@@ -5924,7 +7204,7 @@ State.SpearObj = (function()
     return V
 end)()
 
-State.CreateDropdown = function(parentFrame, titleText, values, current, callback, idPrefix)
+State.CreateDropdown = function(parentFrame, titleText, values, current, callback, idPrefix, noRegister)
     local sel, items = {}, {}
     for _, v in ipairs(values) do
         items[#items + 1] = { v, v }
@@ -5933,7 +7213,7 @@ State.CreateDropdown = function(parentFrame, titleText, values, current, callbac
     if current == nil or sel[current] == nil then sel[values[1]] = true end
     return CreateMultiDropdown(parentFrame, titleText, items, sel, function(key, on)
         if on and callback then callback(key) end
-    end, idPrefix, true)
+    end, idPrefix, true, noRegister)
 end
 
 local SurvTab = CreateTab("SURVIVOR", ICONS.SURVIVOR, 2)
@@ -5967,23 +7247,24 @@ CreateSlider(ParrySection, "Parry Range", 5, 35, 14, " studs", function(value)
 end)
 CreateSlider(ParrySection, "Face Sensitivity", 0, 10, 6, "", function(value)
     Parry.FaceSensitivity = value
-    Parry.FaceMemo = setmetatable({}, { __mode = "k" })
 end)
 CreateToggle(ParrySection, "Aggressive Mode", true, function(state)
     Parry.AggressiveMode = state
-    Parry.FaceMemo = setmetatable({}, { __mode = "k" })
-    -- cannot run together with Anti Fake Hit
+    -- tidak bisa bareng Anti Fake Hit
     if state and Z.AntiFakeHit then
         Z.AntiFakeHit = false
         local t = ToggleRegistry["anti_fake_hit"]
         if t and t.getState() then t.setState(false, true) end
     end
 end)
-CreateToggle(ParrySection, "Show Range Circle", false, function(state)
-    Parry.CircleVisible = state
-end)
 CreateToggle(ParrySection, "Anti Fake Hit", false, function(state)
     Z.SetAntiFakeHit(state)
+end)
+CreateToggle(ParrySection, "Safety Parry", false, function(state)
+    Parry.SafetyParry = state
+end)
+CreateToggle(ParrySection, "Show Range Circle", false, function(state)
+    Parry.CircleVisible = state
 end)
 CreateToggle(ParrySection, "Button Parry", false, function(state)
     FloatingParryButtonEnabled = state
@@ -5991,6 +7272,30 @@ CreateToggle(ParrySection, "Button Parry", false, function(state)
     if type(shortcut) == "table" and shortcut.Gui then
         shortcut.Gui.Enabled = state
     end
+end)
+
+local TofSection = CreateSection(SurvTab, "SILENT TWIST OF FATE", false)
+CreateToggle(TofSection, "Silent Twist of Fate", false, function(state)
+    State.TOFSilent.Enabled = state
+    Hooks.TOFSilent(State.TOFSilent)
+end)
+State.CreateDropdown(TofSection, "Aim At", { "Head", "UpperTorso", "HumanoidRootPart" }, State.TOFSilent.AimPart or "UpperTorso", function(v)
+    State.TOFSilent.AimPart = v
+end, "tofaim")
+CreateSlider(TofSection, "FOV Size", 10, 360, 120, "", function(value)
+    State.TOFSilent.FOV = value
+end)
+CreateToggle(TofSection, "Predict Movement", true, function(state)
+    State.TOFSilent.Predict = state
+end)
+CreateSlider(TofSection, "Prediction Strength", 50, 250, 100, "%", function(value)
+    State.TOFSilent.LeadScale = value
+end)
+CreateToggle(TofSection, "Show FOV Circle", true, function(state)
+    State.TOFSilent.ShowCircle = state
+end)
+CreateToggle(TofSection, "Show Laser", true, function(state)
+    State.TOFSilent.ShowLaser = state
 end)
 
 do
@@ -6110,6 +7415,877 @@ CreateMultiDropdown(VisualWorld, "Highlight", {
     { "HLFill", "Highlight Fill" },
     { "HLOutline", "Highlight Outline" },
 }, State.ESPWorld, State.WorldESPChanged, "wesp")
+
+-- ===== WORLD SETTINGS: Fullbright / Day Time / No Fog / No Shadow / Low Graphic / Clean Sky =====
+do
+    if type(Z.ZirthWorldRestore) == "function" then pcall(Z.ZirthWorldRestore) end
+
+    local W = { Fullbright = false, DayTime = false, NoFog = false, NoShadow = false, LowGraphic = false, CleanSky = false }
+    State.WorldFX = W
+
+    local FULLBRIGHT_COLOR = Color3.fromRGB(178, 178, 178)
+    local clockTime = 14
+
+    -- plain Lighting properties: snapshot when switched on, put back when switched off
+    local LIGHT_FX = {
+        Fullbright = {
+            keys = { "Brightness", "Ambient", "OutdoorAmbient", "ExposureCompensation" },
+            apply = function()
+                Lighting.Brightness = 2
+                Lighting.Ambient = FULLBRIGHT_COLOR
+                Lighting.OutdoorAmbient = FULLBRIGHT_COLOR
+                Lighting.ExposureCompensation = 0
+            end,
+        },
+        DayTime = {
+            keys = { "ClockTime" },
+            apply = function() Lighting.ClockTime = math.clamp(tonumber(clockTime) or 14, 0, 24) end,
+        },
+        NoFog = {
+            keys = { "FogStart", "FogEnd" },
+            apply = function()
+                Lighting.FogStart = 9e8
+                Lighting.FogEnd = 9e8
+            end,
+        },
+        NoShadow = {
+            keys = { "GlobalShadows", "ShadowSoftness" },
+            apply = function()
+                Lighting.GlobalShadows = false
+                pcall(function() Lighting.ShadowSoftness = 0 end)
+            end,
+        },
+    }
+    local lightSnap = {}
+
+    local function snapLighting(name)
+        local t = {}
+        for _, k in ipairs(LIGHT_FX[name].keys) do
+            local ok, v = pcall(function() return Lighting[k] end)
+            if ok then t[k] = v end
+        end
+        lightSnap[name] = t
+    end
+    local function restoreLighting(name)
+        local t = lightSnap[name]
+        if not t then return end
+        for k, v in pairs(t) do pcall(function() Lighting[k] = v end) end
+        lightSnap[name] = nil
+    end
+    local function applyLighting(name)
+        pcall(LIGHT_FX[name].apply)
+    end
+
+    -- Atmosphere (fog haze, glare)
+    local atmoOrig = setmetatable({}, { __mode = "k" })
+    local function refreshAtmosphere()
+        local want = W.NoFog or W.CleanSky
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("Atmosphere") then
+                if want then
+                    if not atmoOrig[obj] then
+                        atmoOrig[obj] = { Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare }
+                    end
+                    if W.NoFog then obj.Density = 0 end
+                    obj.Haze = 0
+                    if W.CleanSky then obj.Glare = 0 end
+                elseif atmoOrig[obj] then
+                    for k, v in pairs(atmoOrig[obj]) do pcall(function() obj[k] = v end) end
+                    atmoOrig[obj] = nil
+                end
+            end
+        end
+        if not want then
+            for obj, o in pairs(atmoOrig) do
+                for k, v in pairs(o) do pcall(function() obj[k] = v end) end
+                atmoOrig[obj] = nil
+            end
+        end
+    end
+
+    -- post effects (bloom, blur, sun rays, depth of field)
+    local effOrig = setmetatable({}, { __mode = "k" })
+    local function effectShouldBeOff(eff)
+        if eff:IsA("SunRaysEffect") then return W.LowGraphic or W.CleanSky end
+        if eff:IsA("BloomEffect") or eff:IsA("BlurEffect") or eff:IsA("DepthOfFieldEffect") then return W.LowGraphic end
+        return false
+    end
+    local function refreshEffects()
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("PostEffect") then
+                if effectShouldBeOff(obj) then
+                    if effOrig[obj] == nil then effOrig[obj] = obj.Enabled end
+                    obj.Enabled = false
+                elseif effOrig[obj] ~= nil then
+                    obj.Enabled = effOrig[obj]
+                    effOrig[obj] = nil
+                end
+            end
+        end
+    end
+
+    -- sky + clouds
+    local skyOrig = setmetatable({}, { __mode = "k" })
+    local cloudOrig = setmetatable({}, { __mode = "k" })
+    local function refreshSky()
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("Sky") then
+                if W.CleanSky then
+                    if not skyOrig[obj] then
+                        skyOrig[obj] = { StarCount = obj.StarCount, CelestialBodiesShown = obj.CelestialBodiesShown }
+                    end
+                    obj.StarCount = 0
+                    obj.CelestialBodiesShown = false
+                elseif skyOrig[obj] then
+                    for k, v in pairs(skyOrig[obj]) do pcall(function() obj[k] = v end) end
+                    skyOrig[obj] = nil
+                end
+            end
+        end
+        local terrain = workspace:FindFirstChildOfClass("Terrain")
+        local clouds = terrain and terrain:FindFirstChildOfClass("Clouds")
+        if clouds then
+            if W.CleanSky then
+                if cloudOrig[clouds] == nil then cloudOrig[clouds] = clouds.Enabled end
+                clouds.Enabled = false
+            elseif cloudOrig[clouds] ~= nil then
+                clouds.Enabled = cloudOrig[clouds]
+                cloudOrig[clouds] = nil
+            end
+        end
+    end
+
+    -- low graphic: quality level, plain materials, no shadows/reflections/particles
+    local partOrig = setmetatable({}, { __mode = "k" })
+    local qualityOrig
+    local scanToken = 0
+    local descConn
+
+    local function isCharacterPart(obj)
+        local m = obj:FindFirstAncestorOfClass("Model")
+        return m ~= nil and m:FindFirstChildOfClass("Humanoid") ~= nil
+    end
+    local function lowerObject(obj)
+        if partOrig[obj] then return end
+        if obj:IsA("BasePart") then
+            if isCharacterPart(obj) then return end
+            partOrig[obj] = { Material = obj.Material, Reflectance = obj.Reflectance, CastShadow = obj.CastShadow }
+            obj.Material = Enum.Material.SmoothPlastic
+            obj.Reflectance = 0
+            obj.CastShadow = false
+        elseif obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") then
+            partOrig[obj] = { Enabled = obj.Enabled }
+            obj.Enabled = false
+        end
+    end
+    local function restoreObject(obj, o)
+        for k, v in pairs(o) do pcall(function() obj[k] = v end) end
+    end
+
+    local function startLowGraphic()
+        scanToken = scanToken + 1
+        local token = scanToken
+        pcall(function()
+            local r = settings().Rendering
+            if qualityOrig == nil then qualityOrig = r.QualityLevel end
+            r.QualityLevel = Enum.QualityLevel.Level01
+        end)
+        pcall(function()
+            local terrain = workspace:FindFirstChildOfClass("Terrain")
+            if terrain then terrain.WaterWaveSize = 0; terrain.WaterReflectance = 0 end
+        end)
+        if descConn then descConn:Disconnect() end
+        descConn = workspace.DescendantAdded:Connect(function(obj)
+            if W.LowGraphic and not unloaded then pcall(lowerObject, obj) end
+        end)
+        task.spawn(function()
+            local n = 0
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if token ~= scanToken or unloaded or not W.LowGraphic then return end
+                pcall(lowerObject, obj)
+                n = n + 1
+                if n % 400 == 0 then task.wait() end
+            end
+        end)
+    end
+
+    local function stopLowGraphic()
+        scanToken = scanToken + 1
+        if descConn then descConn:Disconnect(); descConn = nil end
+        pcall(function()
+            if qualityOrig ~= nil then settings().Rendering.QualityLevel = qualityOrig end
+            qualityOrig = nil
+        end)
+        task.spawn(function()
+            local n = 0
+            for obj, o in pairs(partOrig) do
+                if W.LowGraphic then return end
+                if obj.Parent then restoreObject(obj, o) end
+                partOrig[obj] = nil
+                n = n + 1
+                if n % 400 == 0 then task.wait() end
+            end
+        end)
+    end
+
+    local function refreshShared()
+        pcall(refreshAtmosphere)
+        pcall(refreshEffects)
+        pcall(refreshSky)
+    end
+
+    local function setFX(name, state)
+        state = state == true
+        if W[name] == state then return end
+        W[name] = state
+        if LIGHT_FX[name] then
+            if state then
+                snapLighting(name)
+                applyLighting(name)
+            else
+                restoreLighting(name)
+            end
+        end
+        if name == "LowGraphic" then
+            if state then startLowGraphic() else stopLowGraphic() end
+        end
+        refreshShared()
+    end
+
+    -- the game may rewrite Lighting (day/night cycle, fog, ...): keep our values in place
+    task.spawn(function()
+        local tick = 0
+        while not unloaded and Z.ZirthHubSession == session do
+            for name in pairs(LIGHT_FX) do
+                if W[name] then applyLighting(name) end
+            end
+            tick = tick + 1
+            if tick % 4 == 0 and (W.NoFog or W.CleanSky or W.LowGraphic) then refreshShared() end
+            task.wait(0.25)
+        end
+    end)
+
+    Z.ZirthWorldRestore = function()
+        for name in pairs(W) do
+            if W[name] then setFX(name, false) end
+        end
+    end
+
+    local WorldSettings = CreateSection(VisualTab, "WORLD SETTINGS", false)
+    State.WorldSettingsSection = WorldSettings
+    CreateToggle(WorldSettings, "Fullbright", false, function(state) setFX("Fullbright", state) end)
+    CreateToggle(WorldSettings, "Day Time", false, function(state) setFX("DayTime", state) end)
+    CreateSlider(WorldSettings, "Time Of Day", 0, 24, 14, " h", function(value)
+        clockTime = value
+        if W.DayTime then pcall(LIGHT_FX.DayTime.apply) end
+    end)
+    CreateToggle(WorldSettings, "No Fog", false, function(state) setFX("NoFog", state) end)
+    CreateToggle(WorldSettings, "No Shadow", false, function(state) setFX("NoShadow", state) end)
+    CreateToggle(WorldSettings, "Low Graphic", false, function(state) setFX("LowGraphic", state) end)
+    CreateToggle(WorldSettings, "Clean Sky", false, function(state) setFX("CleanSky", state) end)
+end
+
+-- ===== CAMERA: Custom FOV + Unlimited Zoom =====
+do
+    pcall(function() RunService:UnbindFromRenderStep("ZirthCamera") end)
+    if type(Z.ZirthCameraRestore) == "function" then pcall(Z.ZirthCameraRestore) end
+
+    local CAM = { FovOn = false, Fov = 70, ZoomOn = false }
+    State.CameraFX = CAM
+    local origFov, origMax, origMin, origMode
+    local zoomConns = {}
+    local zoomD = nil          -- our own camera distance (only used when it is bigger than the game's)
+    local lastPinch = 1
+    local ZOOM_MAX, ZOOM_MIN, ZOOM_STEP = 5000, 0.5, 1.15
+
+    local function applyZoomLimits()
+        pcall(function()
+            if LP.CameraMaxZoomDistance < 1e5 then LP.CameraMaxZoomDistance = 1e5 end
+            if LP.CameraMinZoomDistance > ZOOM_MIN then LP.CameraMinZoomDistance = ZOOM_MIN end
+            if LP.CameraMode == Enum.CameraMode.LockFirstPerson then
+                LP.CameraMode = Enum.CameraMode.Classic
+            end
+        end)
+    end
+
+    local function focusPosition(cam)
+        local f = cam.Focus.Position
+        if (f - cam.CFrame.Position).Magnitude > 4000 then
+            local char = LP.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then return hrp.Position + Vector3.new(0, 1.5, 0) end
+        end
+        return f
+    end
+
+    -- Works even when the game's own camera script clamps zoom: the wheel / pinch moves the camera
+    -- further back along its view direction once the game's own zoom has stopped.
+    local function zoomOut(factor)
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local base = (cam.CFrame.Position - focusPosition(cam)).Magnitude
+        if zoomD == nil or zoomD < base then zoomD = base end
+        zoomD = math.clamp(zoomD * factor, ZOOM_MIN, ZOOM_MAX)
+    end
+
+    local function connectZoomInput()
+        if #zoomConns > 0 then return end
+        zoomConns[#zoomConns + 1] = UserInputService.InputChanged:Connect(function(input, processed)
+            if processed or unloaded or not CAM.ZoomOn then return end
+            if input.UserInputType == Enum.UserInputType.MouseWheel then
+                if input.Position.Z > 0 then zoomOut(1 / ZOOM_STEP) else zoomOut(ZOOM_STEP) end
+            end
+        end)
+        zoomConns[#zoomConns + 1] = UserInputService.TouchPinch:Connect(function(_, scale, _, state, processed)
+            if processed or unloaded or not CAM.ZoomOn then return end
+            if state == Enum.UserInputState.Begin then
+                lastPinch = 1
+            elseif state == Enum.UserInputState.Change and scale > 0 and lastPinch > 0 then
+                local ratio = scale / lastPinch
+                lastPinch = scale
+                zoomOut(1 / ratio)
+            end
+        end)
+    end
+    local function disconnectZoomInput()
+        for _, c in ipairs(zoomConns) do pcall(function() c:Disconnect() end) end
+        zoomConns = {}
+        zoomD = nil
+    end
+
+    -- runs right after the game's own camera scripts, every frame, so the game cannot overwrite it
+    local function step()
+        if unloaded then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        if CAM.FovOn then
+            local want = math.clamp(tonumber(CAM.Fov) or 70, 1, 120)
+            if math.abs(cam.FieldOfView - want) > 0.01 then cam.FieldOfView = want end
+        end
+        if CAM.ZoomOn then
+            applyZoomLimits()
+            if zoomD then
+                local focus = focusPosition(cam)
+                local base = (cam.CFrame.Position - focus).Magnitude
+                if zoomD <= base + 0.05 then
+                    zoomD = nil                      -- the game's own zoom is already at least this far: hands off
+                else
+                    local look = cam.CFrame.LookVector
+                    cam.CFrame = CFrame.new(focus - look * zoomD) * cam.CFrame.Rotation
+                end
+            end
+        end
+    end
+
+    local bound = false
+    local function updateBinding()
+        local need = CAM.FovOn or CAM.ZoomOn
+        if need and not bound then
+            bound = true
+            RunService:BindToRenderStep("ZirthCamera", Enum.RenderPriority.Camera.Value + 1, step)
+        elseif not need and bound then
+            bound = false
+            pcall(function() RunService:UnbindFromRenderStep("ZirthCamera") end)
+        end
+    end
+
+    local function setFov(state)
+        state = state == true
+        if CAM.FovOn == state then return end
+        local cam = workspace.CurrentCamera
+        if state then
+            origFov = cam and cam.FieldOfView or 70
+        elseif cam and origFov then
+            cam.FieldOfView = origFov
+        end
+        CAM.FovOn = state
+        updateBinding()
+    end
+
+    local function setZoom(state)
+        state = state == true
+        if CAM.ZoomOn == state then return end
+        if state then
+            origMax, origMin, origMode = LP.CameraMaxZoomDistance, LP.CameraMinZoomDistance, LP.CameraMode
+            applyZoomLimits()
+            connectZoomInput()
+            -- undo the game putting its own limits back, the moment it happens
+            for _, prop in ipairs({ "CameraMaxZoomDistance", "CameraMinZoomDistance", "CameraMode" }) do
+                zoomConns[#zoomConns + 1] = LP:GetPropertyChangedSignal(prop):Connect(function()
+                    if CAM.ZoomOn then applyZoomLimits() end
+                end)
+            end
+        else
+            disconnectZoomInput()
+            pcall(function()
+                if origMax then LP.CameraMaxZoomDistance = origMax end
+                if origMin then LP.CameraMinZoomDistance = origMin end
+                if origMode then LP.CameraMode = origMode end
+            end)
+        end
+        CAM.ZoomOn = state
+        updateBinding()
+    end
+
+    Z.ZirthCameraRestore = function()
+        setFov(false)
+        setZoom(false)
+    end
+
+    local CameraSection = State.WorldSettingsSection
+    CreateToggle(CameraSection, "Custom FOV", false, function(state) setFov(state) end)
+    CreateSlider(CameraSection, "FOV", 30, 120, 70, "", function(value)
+        CAM.Fov = value
+    end)
+    CreateToggle(CameraSection, "Unlimited Zoom", false, function(state) setZoom(state) end)
+end
+
+-- ===== AVATAR (copy avatar / presets / korless, ported from Kinon "Avatar Visual") =====
+do
+    local AV = { Enabled = false }
+    State.AvatarVisual = AV
+    local selectedId = LP.UserId
+    local selectedServer, presetName = nil, nil
+    local source = "preset"
+    local lastId = nil
+    local korless = { on = false, conn = nil }
+    local usernameInput = ""
+    local presetUser = ""
+    local presetUserIds = {}
+    local busy = false
+    local origDesc = nil
+    local ours = {}
+
+    local PRESET_USER_LIST = {
+        "116vv",
+        "444jamesss",
+        "kiicaine",
+        "fluvvvvy",
+        "laikaa116",
+        "d4vourz",
+        "penyihirkoji",
+        "itzSannz",
+        "cinhsi",
+        "ausenndipity",
+        "GatoVeZ77",
+        "y0urchocoo",
+        "REZZ_MODEO",
+        "Rev_Z6p",
+        "4Dliii",
+        "EDENinabobo",
+        "farrooy",
+        "judann_7",
+        "ottawa4321",
+        "kazeewww",
+        "erxzha",
+        "lakotree_Doang",
+        "ybvarrr",
+        "ba1mmms",
+        "Anett_oooo",
+    }
+
+    local function say(t) ShowToast("Avatar", t) end
+
+    local function isKillerNow()
+        if LP.Team ~= nil and string.find(string.lower(LP.Team.Name), "killer", 1, true) ~= nil then return true end
+        local ch = LP.Character
+        return ch ~= nil and ch:GetAttribute("MorphedKiller") ~= nil
+    end
+
+    -- ----- korless morph -----
+    local function applyKorlessOnce()
+        local ch = LP.Character
+        if not ch then return end
+        local leg = ch:FindFirstChild("Right Leg") or ch:FindFirstChild("RightUpperLeg")
+        local head = ch:FindFirstChild("Head")
+        if not leg or not head or ch:FindFirstChild("KorlessHead") then return end
+        head.Transparency = 1
+        local face = head:FindFirstChild("face")
+        if face then face:Destroy() end
+        leg.Transparency = 1
+        local mp = Instance.new("MeshPart")
+        mp.Name = "KorlessHead"
+        mp.Size = Vector3.new(0.85, 0.85, 0.85)
+        mp.CanCollide = false
+        mp.MeshId = "rbxassetid://902942096"
+        mp.TextureID = "rbxassetid://902843398"
+        mp.CFrame = leg.CFrame * CFrame.new(0, 0.7, 0)
+        mp.Parent = ch
+        local w = Instance.new("WeldConstraint")
+        w.Part0 = leg
+        w.Part1 = mp
+        w.Parent = mp
+    end
+
+    local function removeKorless()
+        local ch = LP.Character
+        if not ch then return end
+        local kh = ch:FindFirstChild("KorlessHead")
+        if kh then kh:Destroy() end
+        local head = ch:FindFirstChild("Head")
+        if head then head.Transparency = 0 end
+        local leg = ch:FindFirstChild("Right Leg") or ch:FindFirstChild("RightUpperLeg")
+        if leg then leg.Transparency = 0 end
+    end
+
+    local function setKorless(v)
+        korless.on = v and true or false
+        if korless.conn then korless.conn:Disconnect(); korless.conn = nil end
+        if korless.on then
+            task.spawn(applyKorlessOnce)
+            korless.conn = LP.CharacterAdded:Connect(function()
+                task.wait(1)
+                if korless.on and not unloaded then applyKorlessOnce() end
+            end)
+        else
+            removeKorless()
+        end
+    end
+
+    -- ----- legacy appearance loader (fallback) -----
+    local function loadAppearance(appearance, character, head)
+        local items = appearance:GetChildren()
+        local function applyMesh(obj)
+            if obj:IsA("CharacterMesh") or obj:IsA("BodyColors") or obj:IsA("Shirt") or obj:IsA("Pants") then
+                local existing = character:FindFirstChild(obj.Name)
+                if existing and existing.ClassName == obj.ClassName then existing:Destroy() end
+                obj:Clone().Parent = character
+            end
+        end
+        for _, item in pairs(items) do
+            if item:IsA("Folder") or item:IsA("Model") then
+                for _, sub in pairs(item:GetChildren()) do applyMesh(sub) end
+            else
+                applyMesh(item)
+            end
+        end
+        for _, item in pairs(items) do
+            if item:IsA("SpecialMesh") and head then
+                local tm = head:FindFirstChildOfClass("SpecialMesh") or Instance.new("SpecialMesh", head)
+                tm.MeshType = Enum.MeshType.FileMesh
+                tm.MeshId = item.MeshId
+                tm.TextureId = item.TextureId
+            elseif item:IsA("Decal") and item.Name == "face" and head then
+                if head:FindFirstChild("face") then head.face:Destroy() end
+                item:Clone().Parent = head
+            end
+        end
+        for _, item in pairs(items) do
+            if item:IsA("Accessory") then
+                local clone = item:Clone()
+                local handle = clone:FindFirstChild("Handle")
+                if handle then
+                    local att = handle:FindFirstChildOfClass("Attachment")
+                    if att then
+                        local ta = character:FindFirstChild(att.Name, true)
+                        if ta then
+                            local weld = Instance.new("Weld")
+                            weld.Part0 = handle
+                            weld.Part1 = ta.Parent
+                            weld.C0 = att.CFrame
+                            weld.C1 = ta.CFrame
+                            weld.Parent = handle
+                        end
+                    end
+                    handle.CanCollide = false
+                    handle.Massless = true
+                    clone.Parent = character
+                end
+            end
+        end
+    end
+
+    local function legacyApply(id, character, humanoid)
+        local ok, appearance = pcall(function() return Players:GetCharacterAppearanceAsync(id) end)
+        if not ok or not appearance then return false end
+        for _, obj in pairs(character:GetChildren()) do
+            if obj:IsA("Accessory") or obj:IsA("Shirt") or obj:IsA("Pants")
+                or obj:IsA("BodyColors") or obj:IsA("CharacterMesh") or obj:IsA("ShirtGraphic") then
+                obj:Destroy()
+            end
+        end
+        local head = character:FindFirstChild("Head")
+        if head then
+            for _, h in pairs(head:GetChildren()) do
+                if h:IsA("SpecialMesh") or h:IsA("Decal") then h:Destroy() end
+            end
+            local m = Instance.new("SpecialMesh", head)
+            m.MeshType = Enum.MeshType.Head
+            m.Scale = Vector3.new(1, 1, 1)
+        end
+        local defaults = {
+            BodyDepthScale = 1, BodyHeightScale = 1, BodyWidthScale = 1,
+            HeadScale = 1, BodyTypeScale = 0, BodyProportionScale = 0,
+        }
+        for name, val in pairs(defaults) do
+            local sv = humanoid:FindFirstChild(name)
+            if sv then sv.Value = val end
+        end
+        task.wait(0.1)
+        loadAppearance(appearance, character, head)
+        pcall(function()
+            local info = Players:GetCharacterAppearanceInfoAsync(id)
+            if head and info.assets then
+                for _, asset in pairs(info.assets) do
+                    if asset.assetType.name == "Face" then
+                        if head:FindFirstChild("face") then head.face:Destroy() end
+                        local f = Instance.new("Decal", head)
+                        f.Name = "face"
+                        f.Texture = "rbxassetid://" .. asset.id
+                        break
+                    end
+                end
+            end
+        end)
+        return true
+    end
+
+    -- ----- killer safety: our visual items are removed while we are the killer -----
+    local function markOurs()
+        ours = {}
+        local ch = LP.Character
+        if not ch then return end
+        for _, c in ipairs(ch:GetChildren()) do
+            if c:IsA("Accessory") then ours[c] = true end
+        end
+    end
+
+    local function stripForKiller()
+        for acc in pairs(ours) do
+            pcall(function() if acc.Parent then acc:Destroy() end end)
+        end
+        ours = {}
+    end
+
+    -- ----- copy / apply avatar -----
+    local BODY_FIELDS = { "Head", "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg" }
+
+    local function descApply(id, humanoid, override)
+        local desc = override
+        if not desc then
+            for _ = 1, 3 do
+                local ok, d = pcall(function() return Players:GetHumanoidDescriptionFromUserId(id) end)
+                if ok and d then desc = d break end
+                task.wait(0.4)
+            end
+            if not desc then return false end
+        end
+        local core = false
+        for attempt = 1, 4 do
+            if not humanoid.Parent then return false end
+            local applied = pcall(function() humanoid:ApplyDescriptionReset(desc) end)
+            if not applied then applied = pcall(function() humanoid:ApplyDescription(desc) end) end
+            if not applied then
+                task.wait(0.3)
+            else
+                task.wait(0.35 + 0.15 * attempt)
+                local okA, cur = pcall(function() return humanoid:GetAppliedDescription() end)
+                if okA and cur then
+                    core = cur.Shirt == desc.Shirt and cur.Pants == desc.Pants and cur.Face == desc.Face
+                    local bodyOk = true
+                    for _, f in ipairs(BODY_FIELDS) do
+                        if cur[f] ~= desc[f] then bodyOk = false break end
+                    end
+                    if core and bodyOk then return true end
+                end
+            end
+        end
+        return core
+    end
+
+    local function applyAvatar(id)
+        local character = LP.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then
+            say("No character")
+            return
+        end
+        if isKillerNow() then
+            say("Not available as Killer")
+            return
+        end
+        if not origDesc then
+            local okO, d = pcall(function() return humanoid:GetAppliedDescription() end)
+            if okO and d then origDesc = d end
+        end
+        lastId = id
+        local done
+        if id == LP.UserId and origDesc then
+            done = descApply(id, humanoid, origDesc)
+        else
+            done = descApply(id, humanoid)
+            if not done then done = legacyApply(id, character, humanoid) end
+        end
+        if done then markOurs() end
+        if korless.on then
+            task.wait(0.1)
+            applyKorlessOnce()
+        end
+        say(done and "Applied" or "Failed")
+    end
+
+    local function resolveId()
+        if source == "user" then
+            if usernameInput == "" then return nil, "Enter a username or ID" end
+            local n = tonumber(usernameInput)
+            if n then return n end
+            local ok, id = pcall(function() return Players:GetUserIdFromNameAsync(usernameInput) end)
+            if not ok or not id then return nil, "User not found" end
+            return id
+        end
+        if source == "presetuser" then
+            local cached = presetUserIds[presetUser]
+            if cached then return cached end
+            local ok, id = pcall(function() return Players:GetUserIdFromNameAsync(presetUser) end)
+            if not ok or not id then return nil, "User not found" end
+            presetUserIds[presetUser] = id
+            return id
+        end
+        return selectedId
+    end
+
+    -- ----- UI -----
+    local Section = CreateSection(VisualTab, "AVATAR", false)
+
+    CreateToggle(Section, "Keep Avatar After Respawn", false, function(state)
+        AV.Enabled = state == true
+        if AV.Enabled and lastId then task.spawn(applyAvatar, lastId) end
+    end)
+
+    -- Server players: list is rebuilt in place whenever someone joins / leaves
+    local srvItems, srvSel = {}, {}
+    local function refreshServerList()
+        for i = #srvItems, 1, -1 do srvItems[i] = nil end
+        local names = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP then names[#names + 1] = p.Name end
+        end
+        table.sort(names)
+        if #names == 0 then names[1] = "No players" end
+        for _, n in ipairs(names) do srvItems[#srvItems + 1] = { n, n } end
+        for k in pairs(srvSel) do srvSel[k] = (k == selectedServer) end
+    end
+    refreshServerList()
+    track(Players.PlayerAdded:Connect(function() task.delay(1, refreshServerList) end))
+    track(Players.PlayerRemoving:Connect(function() task.delay(1, refreshServerList) end))
+
+    CreateMultiDropdown(Section, "Server Players", srvItems, srvSel, function(key, on)
+        if not on then return end
+        selectedServer = key
+        local plr = Players:FindFirstChild(key)
+        if plr and plr.UserId then
+            selectedId = plr.UserId
+            source = "server"
+        end
+    end, "avsrv", true, true)
+
+    local PRESET_ORDER = {}
+    for _, n in ipairs(PRESET_USER_LIST) do PRESET_ORDER[#PRESET_ORDER + 1] = n end
+    presetName, presetUser, source = PRESET_ORDER[1], PRESET_ORDER[1], "presetuser"
+
+    State.CreateDropdown(Section, "Preset Avatars", PRESET_ORDER, presetName, function(v)
+        presetName = v
+        presetUser = v
+        source = "presetuser"
+    end, "avpreset", true)
+
+    -- username / user id input
+    local InputRow = Instance.new("Frame")
+    InputRow.Parent = Section
+    InputRow.BackgroundColor3 = C.Card
+    InputRow.Size = UDim2.new(1, -6, 0, 38)
+    InputRow.BorderSizePixel = 0
+    corner(InputRow, 2)
+    local InputRowStroke = Instance.new("UIStroke", InputRow)
+    InputRowStroke.Color = C.Line
+    InputRowStroke.Thickness = 1
+    InputRowStroke.Transparency = 0.5
+
+    local InputLabel = Instance.new("TextLabel")
+    InputLabel.Parent = InputRow
+    InputLabel.BackgroundTransparency = 1
+    InputLabel.Position = UDim2.new(0, 12, 0, 0)
+    InputLabel.Size = UDim2.new(0, 90, 1, 0)
+    InputLabel.Font = Enum.Font.GothamBold
+    InputLabel.Text = "Username / ID"
+    InputLabel.TextColor3 = C.Text
+    InputLabel.TextSize = 12
+    InputLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local InputBoxFrame = Instance.new("Frame")
+    InputBoxFrame.Parent = InputRow
+    InputBoxFrame.AnchorPoint = Vector2.new(1, 0.5)
+    InputBoxFrame.Position = UDim2.new(1, -8, 0.5, 0)
+    InputBoxFrame.Size = UDim2.new(1, -118, 0, 24)
+    InputBoxFrame.BackgroundColor3 = C.Panel
+    InputBoxFrame.BorderSizePixel = 0
+    corner(InputBoxFrame, 3)
+    local InputBoxStroke = Instance.new("UIStroke", InputBoxFrame)
+    InputBoxStroke.Color = C.Line
+    InputBoxStroke.Thickness = 1
+    InputBoxStroke.Transparency = 0.35
+
+    local InputBox = Instance.new("TextBox")
+    InputBox.Parent = InputBoxFrame
+    InputBox.BackgroundTransparency = 1
+    InputBox.Position = UDim2.new(0, 8, 0, 0)
+    InputBox.Size = UDim2.new(1, -16, 1, 0)
+    InputBox.Font = Enum.Font.Gotham
+    InputBox.PlaceholderText = "username or user id"
+    InputBox.PlaceholderColor3 = C.TextDim
+    InputBox.Text = ""
+    InputBox.TextColor3 = C.Text
+    InputBox.TextSize = 11
+    InputBox.TextXAlignment = Enum.TextXAlignment.Left
+    InputBox.ClearTextOnFocus = false
+    InputBox.ClipsDescendants = true
+    InputBox:GetPropertyChangedSignal("Text"):Connect(function()
+        usernameInput = (InputBox.Text or ""):gsub("^@", ""):gsub("%s+", "")
+        if usernameInput ~= "" then source = "user" end
+    end)
+    table.insert(SearchItems, { name = "Username / ID", obj = InputRow })
+
+    CreateButton(Section, "Apply Avatar", function()
+        if busy then return end
+        busy = true
+        task.spawn(function()
+            say("Loading...")
+            local id, err = resolveId()
+            if id then applyAvatar(id) else say(err or "Failed") end
+            busy = false
+        end)
+    end, true)
+
+    CreateButton(Section, "Reset Avatar", function()
+        if busy then return end
+        busy = true
+        task.spawn(function()
+            lastId = nil
+            applyAvatar(LP.UserId)
+            lastId = nil
+            busy = false
+        end)
+    end, true)
+
+    CreateToggle(Section, "Korless Morph", false, function(state) setKorless(state) end)
+
+    task.spawn(function()
+        while not unloaded do
+            task.wait(0.5)
+            if isKillerNow() and next(ours) ~= nil then
+                pcall(stripForKiller)
+            end
+        end
+    end)
+
+    track(LP.CharacterAdded:Connect(function()
+        task.wait(2.5)
+        if unloaded then return end
+        if isKillerNow() then return end
+        if AV.Enabled and lastId then applyAvatar(lastId) end
+        if korless.on then applyKorlessOnce() end
+    end))
+end
 
 local ConfigTab = CreateTab("CONFIG", ICONS.CONFIG, 5)
 
